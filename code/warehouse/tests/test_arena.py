@@ -16,7 +16,7 @@ _BASELINE_KEYS = {
     "arena_size", "robot_xy", "robot_yaw", "objects", "target_index",
     "instruction", "stop_r", "horizon", "lighting", "difficulty",
 }
-_WAREHOUSE_KEYS = {"walls", "zones", "layout_name"}
+_WAREHOUSE_KEYS = {"walls", "zones", "layout_name", "hall_x", "hall_y"}
 
 
 class TestSceneCfgContract(unittest.TestCase):
@@ -41,6 +41,10 @@ class TestSceneCfgContract(unittest.TestCase):
 
     def test_arena_size_covers_hall(self) -> None:
         self.assertEqual(self.cfg["arena_size"], 8.0)
+
+    def test_hall_dims_are_exact(self) -> None:
+        self.assertEqual(self.cfg["hall_x"], self.layout.hall_x)
+        self.assertEqual(self.cfg["hall_y"], self.layout.hall_y)
 
     def test_objects_have_baseline_shape(self) -> None:
         objs = self.cfg["objects"]

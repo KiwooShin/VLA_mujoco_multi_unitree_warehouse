@@ -131,6 +131,8 @@ def warehouse_scene_cfg(
     arena_size = max(layout.hall_x, layout.hall_y) / 2.0
     return {
         "arena_size": float(arena_size),
+        "hall_x": float(layout.hall_x),
+        "hall_y": float(layout.hall_y),
         "robot_xy": (float(rx), float(ry)),
         "robot_yaw": float(ryaw),
         "objects": objects,

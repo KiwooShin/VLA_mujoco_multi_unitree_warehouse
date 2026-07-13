@@ -121,6 +121,27 @@ README steps as the baseline. Baseline suite verified green in this repo
 | 4 | collaborative search + fetch (mock pickup: attach within radius) | end-to-end fetch success on seeded evals |
 | 5 | hero demo videos + README + gallery | watchable MP4s pushed; fresh-clone repro (VR-1 rule) |
 
+## 5b. Demo art-pass backlog (from Phase-1a render review, 2026-07-12)
+
+Layout is structurally correct (occlusion verified from robot-eye cams), but
+for recruiter-grade footage the hero scene needs:
+- Floor: replace blue checker with light-gray industrial look inside the hall.
+- Shelves: wood/gray tones (current yellow collides with Charlie's bay color);
+  consider taller/longer blocks — current 2×(2×1.55 m) rows read sparse in the
+  16 m hall. Target "complicated but open": lengthen blocks toward ~3 m each
+  and/or add scattered crate props as extra occluders.
+- SW partition sits close to Alpha's bay — nudge for cleaner sightline story.
+- Lighting: warmer key light; check shadows at BEV angle.
+
+Hardening backlog (from planner adversarial review, 2026-07-12):
+- Hero layout verified reachable for all spawn→object_spot pairs at inflation
+  ≤0.45 m (alcove seals only at 0.50 m). `sample_layout` variants must run the
+  same reachability check at the deployed inflation radius before use.
+- Fetch/task layer should rasterize non-target objects as small obstacles so
+  paths don't clip them (cosmetic now, matters for multi-object scenes).
+- Follower arrive_radius vs steer stop_r interplay is caller-owned: nav loops
+  must pass steer stop_r < follower arrive_radius (Phase 1c tunes this).
+
 ## 6. Risks / known constraints
 
 - 4 humanoids in one MjModel: physics cost scales ~linearly; policy inference
@@ -129,7 +150,14 @@ README steps as the baseline. Baseline suite verified green in this repo
 - Walk policy is OOD-sensitive (>~470-step continuous rotations fall; spawn
   translational drift during large early rotations). Waypoint headings must
   respect the same bounded-scan/turn hygiene the baseline learned (NX-10/12).
-- "Bring it" = mock pickup (weld/attach object when within reach radius,
-  release on pad) — no manipulation policy in the baseline; document clearly.
+- "Bring it" = mock pickup (USER-CONFIRMED 2026-07-12): no grasping policy —
+  when the robot is within reach radius of the object, the object is placed
+  onto the robot's hand link and kinematically re-posed to that hand's world
+  pose every control step (object moves with the robot while carried);
+  released onto the delivery pad at the destination. Implementation: update
+  the object's geom/body pose from the hand body xpos each step in the
+  robot's physics model and mirror it in the shared viz model. Pick a stable
+  G1 hand/wrist body from the XML; offset so the object rests visibly in the
+  hand. Document the assumption prominently in README/demos.
 - VR-1 release rule: before any push that claims a working command, run that
   command end-to-end from a fresh clone.

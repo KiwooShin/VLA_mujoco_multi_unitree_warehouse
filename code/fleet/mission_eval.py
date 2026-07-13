@@ -140,7 +140,8 @@ def run_mission(klass: str, seed: int, layout: WarehouseLayout, spot: int,
                 locomotion: str = "teacher",
                 vla_ckpt: Optional[str] = None,
                 vla_device: Optional[str] = None,
-                callsigns: Optional[Sequence[str]] = None) -> dict:
+                callsigns: Optional[Sequence[str]] = None,
+                reservations: bool = False) -> dict:
     """Run one mission of a class and return its metrics dict."""
     callsigns = list(callsigns) if callsigns is not None else list(CALLSIGNS)
     objs = build_objects(layout, spot, seed)
@@ -150,7 +151,8 @@ def run_mission(klass: str, seed: int, layout: WarehouseLayout, spot: int,
                        callsigns=callsigns, use_gpu=True,
                        search_deadline_steps=max_steps,
                        perception_mode=perception_mode, locomotion=locomotion,
-                       vla_ckpt=vla_ckpt, vla_device=vla_device)
+                       vla_ckpt=vla_ckpt, vla_device=vla_device,
+                       reservations=reservations)
     if klass == "D":
         gt_winner, gt_costs = _independent_allocation(
             layout, mr.scene_cfg, ObjectQuery("red", "cube"), vis,
@@ -237,7 +239,7 @@ def _rooms_plan(seeds: int, layout: Optional[WarehouseLayout] = None
 def run_eval(seeds: int, out_dir: str, max_steps: int,
              perception_mode: str = "oracle", layout_name: str = "hero",
              locomotion: str = "teacher", vla_ckpt: Optional[str] = None,
-             vla_device: Optional[str] = None) -> dict:
+             vla_device: Optional[str] = None, reservations: bool = False) -> dict:
     """Run the full mission suite, write JSON, print the table."""
     os.makedirs(out_dir, exist_ok=True)
     layout = _LAYOUTS.get(layout_name, hero_layout)()
@@ -251,7 +253,7 @@ def run_eval(seeds: int, out_dir: str, max_steps: int,
         r = run_mission(klass, seed, layout, spot, teachers, max_steps,
                         perception_mode=perception_mode, locomotion=locomotion,
                         vla_ckpt=vla_ckpt, vla_device=vla_device,
-                        callsigns=callsigns)
+                        callsigns=callsigns, reservations=reservations)
         results.append(r)
         with open(os.path.join(out_dir, f"mission_{idx:02d}_{klass}.json"), "w") as f:
             json.dump(r, f, indent=2)
@@ -336,10 +338,13 @@ def main(argv: Optional[List[str]] = None) -> None:
                     help="GroundedNav checkpoint for --locomotion vla (default: F5 fine-tune)")
     ap.add_argument("--device", type=str, default=None,
                     help="Torch device for the VLA policy (cuda|cpu; default auto)")
+    ap.add_argument("--reservations", action="store_true",
+                    help="F7: proactive space-time reservation routing (pause stays armed)")
     args = ap.parse_args(argv)
     run_eval(args.seeds, args.out, args.max_steps,
              perception_mode=args.perception, layout_name=args.layout,
-             locomotion=args.locomotion, vla_ckpt=args.ckpt, vla_device=args.device)
+             locomotion=args.locomotion, vla_ckpt=args.ckpt, vla_device=args.device,
+             reservations=args.reservations)
 
 
 if __name__ == "__main__":

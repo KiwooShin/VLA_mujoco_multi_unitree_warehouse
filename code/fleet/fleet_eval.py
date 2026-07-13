@@ -113,6 +113,7 @@ def run_trial(
     callsigns: Optional[List[str]] = None,
     goal_spots: Tuple[int, ...] = _GOAL_SPOTS,
     fallback: Optional[Dict[str, int]] = None,
+    reservations: bool = False,
 ) -> dict:
     """Run one fleet trial and return its per-robot + fleet metrics dict."""
     callsigns = list(callsigns) if callsigns is not None else list(CALLSIGNS)
@@ -123,7 +124,8 @@ def run_trial(
     t0 = time.time()
     fleet = Fleet(layout, goals, callsigns=callsigns, build_viz=False,
                   teachers=teachers, engage=engage, release=release, seed=seed,
-                  locomotion=locomotion, vla_ckpt=vla_ckpt, vla_device=vla_device)
+                  locomotion=locomotion, vla_ckpt=vla_ckpt, vla_device=vla_device,
+                  reservations=reservations)
     fleet.run(max_steps)
     elapsed = time.time() - t0
 
@@ -154,6 +156,10 @@ def run_trial(
         "pause_events": fleet.pause_events,
         "makespan": fleet.makespan,
         "steps": fleet.step_count,
+        "total_walked": round(sum(r["walked"] for r in robots.values()), 3),
+        "reservations": reservations,
+        "st_replans": fleet.st_replans,
+        "st_fallbacks": fleet.st_fallbacks,
         "locomotion": locomotion,
         "mean_vla_infer_ms": round(fleet.mean_vla_infer_ms(), 3),
         "time_s": round(elapsed, 1),
@@ -164,7 +170,7 @@ def run_trial(
 def run_eval(n: int, base_seed: int, out_dir: str, max_steps: int,
              engage: float, release: float, locomotion: str = "teacher",
              vla_ckpt: Optional[str] = None, vla_device: Optional[str] = None,
-             layout_name: str = "hero") -> dict:
+             layout_name: str = "hero", reservations: bool = False) -> dict:
     """Run ``n`` fleet trials, write per-trial + summary JSON, print a table."""
     os.makedirs(out_dir, exist_ok=True)
     layout = _LAYOUTS.get(layout_name, hero_layout)()
@@ -180,7 +186,8 @@ def run_eval(n: int, base_seed: int, out_dir: str, max_steps: int,
         trial = run_trial(seed, layout, max_steps, teachers, engage, release,
                           locomotion=locomotion, vla_ckpt=vla_ckpt,
                           vla_device=vla_device, callsigns=callsigns,
-                          goal_spots=goal_spots, fallback=fallback)
+                          goal_spots=goal_spots, fallback=fallback,
+                          reservations=reservations)
         trials.append(trial)
         with open(os.path.join(out_dir, f"trial_{t:02d}.json"), "w") as f:
             json.dump(trial, f, indent=2)
@@ -190,6 +197,11 @@ def run_eval(n: int, base_seed: int, out_dir: str, max_steps: int,
                          callsigns)
     summary["layout"] = layout_name
     summary["n_robots"] = len(callsigns)
+    summary["reservations"] = reservations
+    summary["mean_total_walked"] = round(
+        float(np.mean([t["total_walked"] for t in trials])), 2)
+    summary["st_replans_total"] = sum(t["st_replans"] for t in trials)
+    summary["st_fallbacks_total"] = sum(t["st_fallbacks"] for t in trials)
     with open(os.path.join(out_dir, "summary.json"), "w") as f:
         json.dump(summary, f, indent=2)
     _print_summary(summary, out_dir)
@@ -255,6 +267,10 @@ def _print_summary(summary: dict, out_dir: str) -> None:
           f"(max {summary['max_makespan']})")
     print(f"pause band: engage={summary['engage_m']}m release={summary['release_m']}m"
           f"   time={summary['total_time_s']}s")
+    print(f"reservations={summary.get('reservations', False)}  "
+          f"mean total walked={summary.get('mean_total_walked')}m  "
+          f"st_replans={summary.get('st_replans_total', 0)}  "
+          f"st_fallbacks={summary.get('st_fallbacks_total', 0)}")
     print(f"artifacts: {out_dir}/")
     print("=" * 74, flush=True)
 
@@ -276,10 +292,12 @@ def main(argv: Optional[List[str]] = None) -> None:
                     help="GroundedNav checkpoint for --locomotion vla (default: F5 fine-tune)")
     ap.add_argument("--device", type=str, default=None,
                     help="Torch device for the VLA policy (cuda|cpu; default auto)")
+    ap.add_argument("--reservations", action="store_true",
+                    help="F7: proactive space-time reservation routing (pause stays armed)")
     args = ap.parse_args(argv)
     run_eval(args.n, args.seed, args.out, args.max_steps, args.engage, args.release,
              locomotion=args.locomotion, vla_ckpt=args.ckpt, vla_device=args.device,
-             layout_name=args.layout)
+             layout_name=args.layout, reservations=args.reservations)
 
 
 if __name__ == "__main__":

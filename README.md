@@ -175,6 +175,16 @@ first to see it reports back (the rest stand down). For a **fleet-addressed** or
 `allocator` computes each robot's actual A\* path length to the object (or, if unseen, to
 its nearest search region) and assigns the **argmin** — provably the shortest-path robot.
 
+Robot-robot conflicts are handled by a mutual-proximity pause (hysteresis, callsign
+priority — zero falls everywhere). A full **space-time reservation planner**
+(`code/planner/reserve.py`: time-expanded A\* with waits over a shared reservation
+table) exists as a tested opt-in (`reservations=True`), but we measured it as a
+behavioral no-op on these layouts (identical success/pauses/makespan over 10 OFF-vs-ON
+trials at 4 and 6 robots) — the aisles are open enough that detours never beat
+proceeding, and the pure-pursuit follower executes geometry, not schedules. So the
+simple mechanism stays the default, with the measurement documented rather than the
+fancier machinery oversold.
+
 ---
 
 ## Honest assumptions

@@ -21,6 +21,7 @@ import numpy as np
 
 from code.fleet.robot_unit import NavParams, RobotUnit
 from code.fleet.viz import FleetViz
+from code.planner.reserve import DEFAULT_SPEED_MPS, ReservationTable
 from code.warehouse.arena import warehouse_scene_cfg
 from code.warehouse.layout import CALLSIGNS, WarehouseLayout
 
@@ -100,6 +101,10 @@ class Fleet:
         locomotion: str = "teacher",
         vla_ckpt: Optional[str] = None,
         vla_device: Optional[str] = None,
+        reservations: bool = False,
+        reservation_speed: Optional[float] = None,
+        reservation_footprint_m: float = 0.30,
+        reservation_t_pad: int = 6,
     ) -> None:
         """Build every robot, assign goals and (optionally) the shared viz model.
 
@@ -129,12 +134,37 @@ class Fleet:
             vla_ckpt: GroundedNav checkpoint (``locomotion="vla"``); None resolves
                 the F5 default.
             vla_device: Torch device for the shared VLA policy (None -> auto).
+            reservations: F7 proactive space-time reservation planning. Default
+                False -> every robot plans the plain A* path and behaviour is
+                byte-identical to the baseline. When True the fleet owns a shared
+                :class:`~code.planner.reserve.ReservationTable`; each robot books
+                its route and plans around the others' bookings on every
+                assign/replan, and releases on arrival/halt. The mutual-proximity
+                pause stays armed underneath as the safety net in BOTH modes.
+            reservation_speed: Conservative model walking speed (m/s) for the
+                space-time model (None -> ``DEFAULT_SPEED_MPS`` = 0.5, calibrated
+                from fleet_eval walked/step data).
+            reservation_footprint_m: Spatial inflation of each booking (m).
+            reservation_t_pad: Temporal inflation of each booking (+/- steps).
         """
         self.callsigns: List[str] = list(callsigns)
         self.priorities: Dict[str, int] = {c: i for i, c in enumerate(self.callsigns)}
         self.engage = float(engage)
         self.release = float(release)
         self.locomotion = locomotion
+        self.step_count = 0
+
+        # F7: the ONE shared reservation table for the fleet (None unless enabled).
+        # Built before any unit so booking at construction sees t0 = step_count = 0.
+        _params = params or NavParams()
+        self.reservations: bool = bool(reservations)
+        self.reservation_table: Optional[ReservationTable] = (
+            ReservationTable(_params.grid_resolution,
+                             footprint_radius_m=reservation_footprint_m,
+                             t_pad=reservation_t_pad)
+            if reservations else None)
+        _resv_speed = (reservation_speed if reservation_speed is not None
+                       else DEFAULT_SPEED_MPS)
 
         scene_cfg = warehouse_scene_cfg(
             layout, robot=self.callsigns[0], objects=objects,
@@ -163,7 +193,11 @@ class Fleet:
                              params=params, teacher=teachers.get(name),
                              use_gpu=use_gpu, locomotion=locomotion,
                              vla_ckpt=vla_ckpt, vla_device=vla_device,
-                             vla_backend=unit_backend)
+                             vla_backend=unit_backend,
+                             reservations=self.reservations,
+                             reservation_table=self.reservation_table,
+                             reservation_speed=_resv_speed,
+                             reservation_now=lambda: self.step_count)
             if name in goals:
                 unit.assign_goal(goals[name])
             self.units[name] = unit
@@ -171,7 +205,6 @@ class Fleet:
         self.viz: Optional[FleetViz] = (
             FleetViz(scene_cfg, self.callsigns) if build_viz else None)
 
-        self.step_count = 0
         self.pause_events = 0
         self._paused: Set[str] = set()
         self.arrive_step: Dict[str, int] = {}
@@ -204,6 +237,10 @@ class Fleet:
         for name, unit in self.units.items():
             if unit.done and name not in self.arrive_step:
                 self.arrive_step[name] = self.step_count
+                # F7: a robot that has arrived owns no useful future space-time;
+                # free its booking so later replans route through it. No-op when
+                # reservations are off.
+                unit.release_reservation()
 
         if self.viz is not None:
             self.viz.sync(self._poses())
@@ -264,6 +301,16 @@ class Fleet:
         """
         vals = [u.vla_infer_ms for u in self.units.values() if u.vla_infer_ms > 0.0]
         return float(sum(vals) / len(vals)) if vals else 0.0
+
+    @property
+    def st_replans(self) -> int:
+        """Total reserved (re)plans across the fleet (0 when reservations off)."""
+        return sum(u.st_replans for u in self.units.values())
+
+    @property
+    def st_fallbacks(self) -> int:
+        """Total ST-search node-budget fallbacks to plain A* (0 when off)."""
+        return sum(u.st_fallbacks for u in self.units.values())
 
     def close(self) -> None:
         """Release the viz renderers."""

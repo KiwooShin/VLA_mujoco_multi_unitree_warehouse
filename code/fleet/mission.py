@@ -136,7 +136,8 @@ class MissionRunner:
                  perception_mode: str = "oracle",
                  locomotion: str = "teacher",
                  vla_ckpt: Optional[str] = None,
-                 vla_device: Optional[str] = None) -> None:
+                 vla_device: Optional[str] = None,
+                 reservations: bool = False) -> None:
         """Build the fleet, bus, per-robot protocols/bridges and carry manager.
 
         Args:
@@ -164,6 +165,9 @@ class MissionRunner:
             vla_ckpt: GroundedNav checkpoint (``locomotion="vla"``; None -> F5
                 default).
             vla_device: Torch device for the shared VLA policy (None -> auto).
+            reservations: F7 proactive space-time reservation routing in the
+                fleet (default False). Searchers replan often, so every replan
+                releases + rebooks; the proximity pause stays the safety net.
         """
         self.layout = layout or hero_layout()
         self.callsigns: List[str] = list(callsigns)
@@ -178,7 +182,8 @@ class MissionRunner:
         self.fleet = Fleet(self.layout, goals={}, callsigns=self.callsigns,
                            use_gpu=use_gpu, teachers=teachers, build_viz=True,
                            seed=seed, objects=objects, locomotion=locomotion,
-                           vla_ckpt=vla_ckpt, vla_device=vla_device)
+                           vla_ckpt=vla_ckpt, vla_device=vla_device,
+                           reservations=reservations)
         self.scene_cfg = self.fleet.scene_cfg
         self._dest_name, self._dest_xy = delivery_xy(self.layout)
 

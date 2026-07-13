@@ -17,11 +17,13 @@ from __future__ import annotations
 
 import enum
 import math
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import numpy as np
 
 from code.apps.warehouse_demo.nav_core import NavParams, StepInfo, StepwiseNav
+from code.planner.reserve import (DEFAULT_SPEED_MPS, ReservationContext,
+                                  ReservationTable)
 from code.sim.teacher import WBCTeacher
 
 Point = Tuple[float, float]
@@ -93,6 +95,10 @@ class RobotUnit:
         vla_ckpt: Optional[str] = None,
         vla_device: Optional[str] = None,
         vla_backend: Optional[object] = None,
+        reservations: bool = False,
+        reservation_table: Optional[ReservationTable] = None,
+        reservation_speed: Optional[float] = None,
+        reservation_now: Optional[Callable[[], int]] = None,
     ) -> None:
         """Build the robot's own physics, spawn it and run the settle phase.
 
@@ -118,6 +124,20 @@ class RobotUnit:
                 one loaded policy model (injected by :class:`~code.fleet.fleet.
                 Fleet`); when None one is created from the process-wide shared
                 policy, so several units still share ONE model.
+            reservations: Enable proactive space-time reservation planning (F7).
+                Default False -> every plan is the plain A* path (byte-identical
+                to the baseline). When True (and ``reservation_table`` is given),
+                each :meth:`assign_goal`/:meth:`halt` books/releases this robot's
+                route in the shared table and plans around other robots' bookings.
+                The proximity pause stays armed underneath in BOTH modes.
+            reservation_table: Shared :class:`~code.planner.reserve.ReservationTable`
+                owned by the :class:`~code.fleet.fleet.Fleet` (required for
+                ``reservations=True`` to have any effect).
+            reservation_speed: Conservative model walking speed (m/s) for the
+                space-time cost/window model (None -> ``DEFAULT_SPEED_MPS``).
+            reservation_now: Callable returning the current control-step index
+                (the fleet's clock); reservations are booked from this ``t0``
+                (None -> a constant 0 clock, used by unit tests).
 
         Raises:
             ValueError: If ``locomotion`` is not ``"teacher"``/``"vla"``.
@@ -133,6 +153,16 @@ class RobotUnit:
         self.locomotion = locomotion
         self.goal_xy: Optional[Point] = None
         self.plan_ok: Optional[bool] = None
+
+        # F7 space-time reservations (additive; off unless a table is supplied).
+        self._resv_on: bool = bool(reservations and reservation_table is not None)
+        self._resv_table: Optional[ReservationTable] = reservation_table
+        self._resv_speed: float = (float(reservation_speed)
+                                   if reservation_speed is not None
+                                   else DEFAULT_SPEED_MPS)
+        self._resv_now: Callable[[], int] = reservation_now or (lambda: 0)
+        self.st_fallbacks: int = 0  # times the ST search fell back to plain A*
+        self.st_replans: int = 0    # times a reserved route was (re)planned
 
         teacher = teacher or WBCTeacher(use_gpu=use_gpu)
         # In VLA mode the nav is built teacher-mode (its WBC settle runs), then
@@ -162,7 +192,10 @@ class RobotUnit:
         if self.state == RobotState.FALLEN:
             self.plan_ok = False
             return False
-        ok = self._nav.plan(goal_xy)
+        if not self._resv_on:
+            ok = self._nav.plan(goal_xy)
+        else:
+            ok = self._plan_reserved(goal_xy)
         self.plan_ok = ok
         if ok:
             self.goal_xy = (float(goal_xy[0]), float(goal_xy[1]))
@@ -171,6 +204,39 @@ class RobotUnit:
             self.goal_xy = None
             self.state = RobotState.IDLE
         return ok
+
+    def _plan_reserved(self, goal_xy: Point) -> bool:
+        """Plan a space-time route and (re)book it in the shared table (F7).
+
+        Releases this robot's prior booking first (a replan supersedes it), plans
+        around every other robot's booking via the ST A*, then books the chosen
+        route from the current fleet clock. Returns like the plain planner.
+        """
+        table = self._resv_table
+        assert table is not None  # guarded by self._resv_on
+        table.release(self.name)
+        t0 = int(self._resv_now())
+        ctx = ReservationContext(table=table, t0=t0, speed=self._resv_speed,
+                                 robot_id=self.name)
+        ok = self._nav.plan(goal_xy, reserve=ctx)
+        if ok:
+            self.st_replans += 1
+            if self._nav.st_fell_back:
+                self.st_fallbacks += 1
+            booking = self._nav.last_booking
+            if booking is not None:
+                cells, cell_times = booking
+                table.reserve(cells, t0, cell_times, self.name)
+        return ok
+
+    def release_reservation(self) -> None:
+        """Drop this robot's space-time booking (arrival/terminal cleanup, F7).
+
+        No-op unless reservations are enabled. Idempotent — safe to call every
+        step once a robot is terminal.
+        """
+        if self._resv_on and self._resv_table is not None:
+            self._resv_table.release(self.name)
 
     def halt(self) -> None:
         """Abort the current goal and hold in place (search-cancel / stop).
@@ -184,6 +250,7 @@ class RobotUnit:
             self._nav.clear_goal()
             self.goal_xy = None
             self.state = RobotState.IDLE
+            self.release_reservation()
 
     # ---- One control step ----
     def step(self, *, paused: bool = False) -> StepInfo:

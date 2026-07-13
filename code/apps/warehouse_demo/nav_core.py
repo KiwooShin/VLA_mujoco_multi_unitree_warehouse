@@ -296,6 +296,10 @@ class StepwiseNav:
         self.goal_xy: Optional[Point] = None
         self.planned_path: List[Point] = []
         self.planned_len: float = 0.0
+        # Space-time reservation bookkeeping (only touched when plan() is given a
+        # ReservationContext; None/False keeps the default nav path byte-identical).
+        self.last_booking: Optional[Tuple[List[Tuple[int, int]], List[int]]] = None
+        self.st_fell_back: bool = False
         self.walked: float = 0.0
         self.min_clear: float = float("inf")
         self.wall_collision: bool = False
@@ -330,11 +334,19 @@ class StepwiseNav:
         return bool(self.follower is not None and self.follower.done)
 
     # ---- Planning ----
-    def plan(self, goal_xy: Point) -> bool:
+    def plan(self, goal_xy: Point, *, reserve: Optional["object"] = None) -> bool:
         """Fit an inflated-grid A* path from the current pose to ``goal_xy``.
 
         Args:
             goal_xy: World (x, y) goal (typically an occluded object spot).
+            reserve: Optional
+                :class:`~code.planner.reserve.ReservationContext`. When None
+                (default) the plain A* path is planned exactly as before — this
+                keeps the whole nav path byte-identical for every existing caller.
+                When provided, a space-time A* route that dodges other robots'
+                bookings is planned instead, and :attr:`last_booking` /
+                :attr:`st_fell_back` are set so the fleet can book the route and
+                log ST-search fallbacks. The proximity pause stays the safety net.
 
         Returns:
             True if a collision-free path was found (a follower is now armed);
@@ -343,8 +355,19 @@ class StepwiseNav:
         grid = build_inflated_grid(self._scene_cfg, self.params.grid_resolution,
                                    self.params.inflate_radius, goal_xy=goal_xy)
         start_xy = self.xy
+        self.last_booking = None
+        self.st_fell_back = False
         try:
-            raw = plan_path(grid, start_xy, goal_xy, snap_radius_m=self.params.snap_radius)
+            if reserve is None:
+                raw = plan_path(grid, start_xy, goal_xy, snap_radius_m=self.params.snap_radius)
+            else:
+                from code.planner.reserve import plan_path_st
+                st = plan_path_st(
+                    grid, reserve.table, start_xy, goal_xy, reserve.t0, reserve.speed,
+                    ignore_id=reserve.robot_id, snap_radius_m=self.params.snap_radius)
+                raw = st.path
+                self.last_booking = (st.cells, st.cell_times)
+                self.st_fell_back = st.fell_back
             path = shortcut_path(grid, raw)
         except PathNotFoundError:
             return False

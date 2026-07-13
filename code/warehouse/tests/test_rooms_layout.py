@@ -10,6 +10,8 @@ import dataclasses
 import math
 import unittest
 
+import numpy as np
+
 from code.planner.astar import PathNotFoundError, plan_path
 from code.planner.grid import inflate
 from code.warehouse.layout import (
@@ -18,10 +20,14 @@ from code.warehouse.layout import (
     WarehouseLayout,
     _BAY_RGBA,
     _MIN_DOORWAY_M,
+    _RM_SPOTS_MAX,
+    _RM_SPOTS_MIN,
+    _all_pairs_reachable,
     _divider_gaps,
     hero_layout,
     room_of,
     rooms_layout,
+    sample_rooms_layout,
     validate_rooms_layout,
 )
 from code.warehouse.occupancy import occupancy_grid
@@ -216,6 +222,91 @@ class TestReachabilityGate(unittest.TestCase):
 
     def test_reachable_at_045(self) -> None:
         self._assert_all_reachable(0.45)
+
+
+class TestSampleRoomsLayout(unittest.TestCase):
+    """The randomized four-room family: determinism, validity, reachability."""
+
+    def test_deterministic_given_same_seed(self) -> None:
+        a = sample_rooms_layout(np.random.default_rng(7))
+        b = sample_rooms_layout(np.random.default_rng(7))
+        self.assertEqual([dataclasses.astuple(w) for w in a.walls],
+                         [dataclasses.astuple(w) for w in b.walls])
+        self.assertEqual(a.object_spots, b.object_spots)
+        self.assertEqual([dataclasses.astuple(z) for z in a.zones],
+                         [dataclasses.astuple(z) for z in b.zones])
+
+    def test_valid_and_reachable_across_seeds(self) -> None:
+        for seed in range(3):
+            layout = sample_rooms_layout(np.random.default_rng(seed))
+            validate_rooms_layout(layout)                 # geometry gate
+            ok, diag = _all_pairs_reachable(layout)       # sec-5b plan gate
+            self.assertTrue(ok, f"seed {seed} unreachable: {diag}")
+
+    def test_structure_preserved(self) -> None:
+        # Same shell, same four rooms/tiling, same bays, solid A|B divider.
+        layout = sample_rooms_layout(np.random.default_rng(1))
+        self.assertEqual((layout.hall_x, layout.hall_y), (20.0, 14.0))
+        self.assertEqual({r.name for r in layout.rooms}, _ROOM_NAMES)
+        self.assertEqual(layout.rooms, rooms_layout().rooms)  # tiling verbatim
+        self.assertEqual(set(layout.spawn_poses), set(CALLSIGNS))
+        self.assertEqual(_divider_gaps(layout, "v", 0.0, -3.5, 3.5), [])
+
+    def test_doorways_wide_enough(self) -> None:
+        layout = sample_rooms_layout(np.random.default_rng(2))
+        south = _divider_gaps(layout, "h", -3.5, -10.0, 10.0)
+        north = _divider_gaps(layout, "h", 3.5, -10.0, 10.0)
+        self.assertEqual((len(south), len(north)), (2, 2))
+        for gw in south + north:
+            self.assertGreaterEqual(gw, _MIN_DOORWAY_M)
+
+    def test_per_room_spot_counts(self) -> None:
+        # 2-3 object spots in every room (loading/A/B/back), all >=0.5 m clear.
+        for seed in range(3):
+            layout = sample_rooms_layout(np.random.default_rng(seed))
+            by_room = {name: 0 for name in _ROOM_NAMES}
+            for xy in layout.object_spots:
+                by_room[room_of(layout, xy)] += 1
+            for name, cnt in by_room.items():
+                self.assertGreaterEqual(cnt, _RM_SPOTS_MIN, (seed, name))
+                self.assertLessEqual(cnt, _RM_SPOTS_MAX, (seed, name))
+
+    def test_delivery_pad_in_storage_b(self) -> None:
+        layout = sample_rooms_layout(np.random.default_rng(0))
+        d = next(z for z in layout.zones if z.name == "delivery")
+        self.assertEqual((d.half_x, d.half_y), (1.0, 1.0))
+        self.assertEqual(room_of(layout, (d.cx, d.cy)), "storage B")
+
+    def test_reachability_gate_actually_gates(self) -> None:
+        # With the gate off, geometry-valid draws may include unreachable ones;
+        # with it on, the returned layout must pass _all_pairs_reachable.
+        gated = sample_rooms_layout(np.random.default_rng(5), enforce_reachable=True)
+        self.assertTrue(_all_pairs_reachable(gated)[0])
+
+    def test_exhaustion_raises_with_diagnostics(self) -> None:
+        with self.assertRaises(RuntimeError) as ctx:
+            sample_rooms_layout(np.random.default_rng(0), max_attempts=0)
+        self.assertIn("no valid+reachable layout", str(ctx.exception))
+
+
+class TestAllPairsReachable(unittest.TestCase):
+    """The sec-5b reachability helper used by both sampler families."""
+
+    def test_fixed_layouts_pass(self) -> None:
+        self.assertTrue(_all_pairs_reachable(rooms_layout())[0])
+        self.assertTrue(_all_pairs_reachable(hero_layout())[0])
+
+    def test_detects_unreachable_goal(self) -> None:
+        # A spot walled off inside a solid interior block is unroutable.
+        base = rooms_layout()
+        boxed = dataclasses.replace(base, object_spots=[(0.0, 0.0)])
+        # Wrap the spot in a small solid block so A* cannot snap out to it.
+        from code.warehouse.layout import WallSpec
+        wall = WallSpec(0.0, 0.0, 0.6, 0.6, height=2.0, name="wall_trap")
+        boxed = dataclasses.replace(boxed, walls=list(base.walls) + [wall])
+        ok, diag = _all_pairs_reachable(boxed, include_delivery=False)
+        self.assertFalse(ok)
+        self.assertIn("unreachable", diag)
 
 
 if __name__ == "__main__":

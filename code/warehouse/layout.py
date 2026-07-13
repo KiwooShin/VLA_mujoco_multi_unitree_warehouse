@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -430,7 +430,8 @@ def hero_layout() -> WarehouseLayout:
     return layout
 
 
-def sample_layout(rng: np.random.Generator) -> WarehouseLayout:
+def sample_layout(rng: np.random.Generator, *,
+                  enforce_reachable: bool = True) -> WarehouseLayout:
     """Return a seeded, validity-preserving variation of the hero layout.
 
     Jitters the mid-row gap, the shelf-row separation, the NE alcove x, the SW
@@ -438,13 +439,24 @@ def sample_layout(rng: np.random.Generator) -> WarehouseLayout:
     keep every invariant satisfied. Retries on the rare invalid draw and falls
     back to :func:`hero_layout` if no valid variation is found.
 
+    Reachability gate (docs/multi_plan.md sec 5b): unless ``enforce_reachable``
+    is disabled, a draw is only accepted if the A* planner can also route every
+    home bay to every object spot (and to the delivery pad) at BOTH the deployed
+    0.40 m and the 0.45 m stress-margin inflation — the jitter can otherwise seal
+    the NE alcove spot, which A* cannot reach even at 0.40 m (verified: ~30% of
+    ungated draws). This closes the same alcove-sealing risk the fixed hero
+    layout is verified against (it seals only at 0.50 m).
+
     Args:
         rng: Caller-owned NumPy generator; advances state.
+        enforce_reachable: Gate accepted draws on the 0.40/0.45 m plan-
+            reachability check (default True). Only turn off for fast geometry-
+            only unit tests.
 
     Returns:
-        A validated :class:`WarehouseLayout`.
+        A validated (and, by default, plan-reachable) :class:`WarehouseLayout`.
     """
-    for _ in range(64):
+    for _ in range(96):
         gap = float(rng.uniform(1.3, 1.8))
         row_cy = float(rng.uniform(1.9, 2.3))
         block_len = float(rng.uniform(1.45, 1.7))
@@ -469,9 +481,11 @@ def sample_layout(rng: np.random.Generator) -> WarehouseLayout:
         )
         try:
             validate_layout(layout)
-            return layout
         except ValueError:
             continue
+        if enforce_reachable and not _all_pairs_reachable(layout)[0]:
+            continue
+        return layout
     return hero_layout()
 
 
@@ -829,3 +843,263 @@ def room_of(layout: WarehouseLayout, xy: Tuple[float, float]) -> str:
             best_key = key
             best = r
     return best.name
+
+
+# ---------------------------------------------------------------------------
+# Plan-reachability gate (docs/multi_plan.md sec 5b) + randomized rooms family.
+# ---------------------------------------------------------------------------
+# The deployed planner clears the robot footprint at 0.40 m; 0.45 m is the stress
+# margin the hero + rooms layouts are verified against (the hero NE alcove seals
+# only at 0.50 m). Every seeded layout variant must route at BOTH before use.
+_PLAN_INFLATIONS: Tuple[float, float] = (0.40, 0.45)
+
+
+def _all_pairs_reachable(
+    layout: WarehouseLayout, *,
+    inflations: Tuple[float, ...] = _PLAN_INFLATIONS,
+    resolution: float = 0.1, snap_radius_m: float = 0.4,
+    include_delivery: bool = True,
+) -> Tuple[bool, str]:
+    """Whether every bay -> object_spot (+ delivery pad) plans at each inflation.
+
+    Implements the docs/multi_plan.md sec 5b gate: a seeded layout variant is
+    usable only if grid A* can route every home bay to every object spot (and,
+    by default, to the delivery pad) at BOTH the deployed 0.40 m clearance
+    inflation and the 0.45 m stress margin. It rasterizes the walls-only
+    occupancy grid the deployed planner shares (``occupancy_grid`` + ``inflate``)
+    and snaps endpoints within ``snap_radius_m`` exactly as the fleet's planner
+    does, so a pass here means the fleet can actually navigate the layout.
+
+    The planner imports are deferred so ``layout.py`` keeps its load-time purity
+    (no module-level planner/MuJoCo dependency); the planner is pulled in only
+    when a variant is gated. Grid reachability is undirected and transitive, so
+    gating bay->spot and bay->delivery also guarantees spot->delivery (the carry
+    leg) whenever both endpoints share the bay's connected component.
+
+    Args:
+        layout: Layout to test (hero or rooms family).
+        inflations: Robot-clearance dilation radii to require routable (m).
+        resolution: Occupancy grid cell size (m).
+        snap_radius_m: Endpoint snap radius, matching the deployed planner (m).
+        include_delivery: Also require every bay -> delivery-pad route.
+
+    Returns:
+        ``(ok, diagnostic)`` — ``ok`` True when all pairs route at all
+        inflations; otherwise ``diagnostic`` names the first failing
+        bay/goal/inflation.
+    """
+    from code.planner.astar import PathNotFoundError, plan_path
+    from code.planner.grid import inflate
+    from code.warehouse.occupancy import occupancy_grid
+
+    goals: List[Tuple[str, Tuple[float, float]]] = [
+        (f"spot{i}", (float(x), float(y)))
+        for i, (x, y) in enumerate(layout.object_spots)
+    ]
+    if include_delivery:
+        for z in layout.zones:
+            if z.name == "delivery":
+                goals.append(("delivery", (float(z.cx), float(z.cy))))
+                break
+
+    og = occupancy_grid(layout, resolution)
+    for r in inflations:
+        ig = inflate(og, r)
+        for cs, (sx, sy, _yaw) in layout.spawn_poses.items():
+            for tag, (gx, gy) in goals:
+                try:
+                    path = plan_path(ig, (float(sx), float(sy)), (gx, gy),
+                                     snap_radius_m=snap_radius_m)
+                except PathNotFoundError:
+                    return (False, f"bay {cs} -> {tag} ({gx:.2f},{gy:.2f}) "
+                                   f"unreachable at inflation {r:.2f}")
+                if not path:
+                    return (False, f"bay {cs} -> {tag} ({gx:.2f},{gy:.2f}) "
+                                   f"empty path at inflation {r:.2f}")
+    return True, ""
+
+
+# Randomized rooms-family jitter ranges (metres). The three split lines stay
+# fixed so the four room boxes and their tiling are preserved verbatim; only the
+# doorway, shelf, object-spot and delivery-pad placements vary WITHIN their room.
+_RM_DOOR_W: Tuple[float, float] = (1.9, 2.3)      # doorway width (>= _MIN_DOORWAY_M)
+_RM_WDOOR_X: Tuple[float, float] = (-7.5, -2.5)   # west doorway centre (storage A x)
+_RM_EDOOR_X: Tuple[float, float] = (2.5, 7.5)     # east doorway centre (storage B x)
+_RM_SHELF_HX: Tuple[float, float] = (1.0, 1.4)    # shelf half-length along x
+_RM_ASHELF_X: Tuple[float, float] = (-8.5, -2.2)  # storage-A shelf cx
+_RM_BSHELF_X: Tuple[float, float] = (2.2, 8.5)    # storage-B shelf cx
+_RM_NSHELF_Y: Tuple[float, float] = (0.6, 2.4)    # north-of-centre shelf cy band
+_RM_SSHELF_Y: Tuple[float, float] = (-2.4, -0.6)  # south-of-centre shelf cy band
+_RM_DELIV_X: Tuple[float, float] = (1.6, 8.6)     # delivery-pad cx (storage B)
+_RM_DELIV_Y: Tuple[float, float] = (-2.4, 2.4)    # delivery-pad cy (storage B)
+_RM_SPOT_MARGIN_M: float = 0.7                    # keep spots this far inside a room box
+_RM_SPOTS_MIN: int = 2                            # per-room object-spot count (inclusive)
+_RM_SPOTS_MAX: int = 3
+
+
+def _uni(rng: np.random.Generator, lohi: Tuple[float, float]) -> float:
+    """Draw one float uniformly from an inclusive ``(lo, hi)`` range."""
+    return float(rng.uniform(lohi[0], lohi[1]))
+
+
+def _sampled_room_walls(rng: np.random.Generator) -> List[WallSpec]:
+    """Build perimeter + jittered dividers (4 doorways) + jittered storage shelves.
+
+    Doorway centres jitter independently on the north and south dividers (west
+    door within storage A's x-half, east within storage B's), and each width is
+    drawn >= :data:`_MIN_DOORWAY_M`. The four storage shelves jitter in x/y and
+    half-length within their room. The solid A|B divider is preserved so the only
+    A<->B routes run through the loading/back rooms.
+    """
+    hx = _ROOMS_HALL_X / 2.0
+    walls = _perimeter_walls(hx, _ROOMS_HALL_Y / 2.0)
+    for line, prefix in ((_SPLIT_Y_S, "wall_div_s"), (_SPLIT_Y_N, "wall_div_n")):
+        gaps = [(_uni(rng, _RM_WDOOR_X), _uni(rng, _RM_DOOR_W)),
+                (_uni(rng, _RM_EDOOR_X), _uni(rng, _RM_DOOR_W))]
+        walls += _divider_walls("h", line, -hx, hx, gaps, height=_PART_H,
+                                rgba=_PART_RGBA, name_prefix=prefix)
+    walls += _divider_walls("v", _SPLIT_X, _SPLIT_Y_S, _SPLIT_Y_N, [],
+                            height=_PART_H, rgba=_PART_RGBA,
+                            name_prefix="wall_div_ab")
+    shelf_specs = (
+        ("shelf_A_n", _RM_ASHELF_X, _RM_NSHELF_Y),
+        ("shelf_A_s", _RM_ASHELF_X, _RM_SSHELF_Y),
+        ("shelf_B_n", _RM_BSHELF_X, _RM_NSHELF_Y),
+        ("shelf_B_s", _RM_BSHELF_X, _RM_SSHELF_Y),
+    )
+    for name, xr, yr in shelf_specs:
+        walls.append(WallSpec(round(_uni(rng, xr), 3), round(_uni(rng, yr), 3),
+                              round(_uni(rng, _RM_SHELF_HX), 3), 0.35,
+                              height=1.8, rgba=_SHELF_RGBA, name=name))
+    return walls
+
+
+def _sampled_room_zones_and_spawns(
+    rng: np.random.Generator,
+) -> Tuple[List[Zone], Dict[str, Tuple[float, float, float]]]:
+    """Build the jittered delivery pad (in storage B) + the fixed home bays.
+
+    The four home bays / spawns are identical to the fixed rooms layout (kept in
+    the loading room so the reachability gate always starts from the same
+    poses); only the 2x2 m delivery pad's centre jitters within storage B.
+    """
+    zones: List[Zone] = [
+        Zone("delivery", round(_uni(rng, _RM_DELIV_X), 3),
+             round(_uni(rng, _RM_DELIV_Y), 3), 1.0, 1.0, _DELIVERY_RGBA),
+    ]
+    spawns: Dict[str, Tuple[float, float, float]] = {}
+    bay_x = {"Alpha": -6.0, "Bravo": -2.0, "Charlie": 2.0, "Delta": 6.0}
+    for cs in CALLSIGNS:
+        bx = bay_x[cs]
+        zones.append(Zone(f"bay_{cs}", bx, -5.5, 0.8, 0.7, _BAY_RGBA[cs]))
+        spawns[cs] = (bx, -5.5, math.pi / 2.0)
+    return zones, spawns
+
+
+def _sampled_room_spots(
+    rng: np.random.Generator, walls: List[WallSpec], delivery: Zone,
+    rooms: Tuple[Room, ...], probe: WarehouseLayout,
+) -> Optional[List[Tuple[float, float]]]:
+    """Sample 2-3 clear object spots per room (or None if a room can't be filled).
+
+    Each spot is drawn inside its room box (shrunk by :data:`_RM_SPOT_MARGIN_M`),
+    kept >= 0.5 m from every wall, >= 0.8 m from other spots, outside the delivery
+    pad, and confirmed by :func:`room_of` to lie in the intended room. Returns
+    ``None`` when a room cannot place its minimum count within the inner attempt
+    budget (the caller then resamples the whole layout).
+    """
+    spots: List[Tuple[float, float]] = []
+
+    def _clear(x: float, y: float) -> bool:
+        if any(_point_rect_distance(x, y, w) < _MIN_CLEAR_M for w in walls):
+            return False
+        if any(math.hypot(x - sx, y - sy) < _MIN_SPOT_SPACING_M
+               for sx, sy in spots):
+            return False
+        if (abs(x - delivery.cx) <= delivery.half_x
+                and abs(y - delivery.cy) <= delivery.half_y):
+            return False
+        return True
+
+    for room in rooms:
+        target = int(rng.integers(_RM_SPOTS_MIN, _RM_SPOTS_MAX + 1))
+        placed = 0
+        for _ in range(80):
+            if placed >= target:
+                break
+            x = _uni(rng, (room.cx - room.half_x + _RM_SPOT_MARGIN_M,
+                           room.cx + room.half_x - _RM_SPOT_MARGIN_M))
+            y = _uni(rng, (room.cy - room.half_y + _RM_SPOT_MARGIN_M,
+                           room.cy + room.half_y - _RM_SPOT_MARGIN_M))
+            if _clear(x, y) and room_of(probe, (x, y)) == room.name:
+                spots.append((round(x, 3), round(y, 3)))
+                placed += 1
+        if placed < _RM_SPOTS_MIN:
+            return None
+    return spots
+
+
+def sample_rooms_layout(rng: np.random.Generator, *, max_attempts: int = 200,
+                        enforce_reachable: bool = True) -> WarehouseLayout:
+    """Return a seeded randomized variant of the four-room layout (F6 family).
+
+    Reject-and-resample generator for a randomized 4-room warehouse that keeps
+    the ``rooms_layout`` structure — same 20x14 m shell, same four named rooms
+    and tiling, same solid A|B divider, same home bays — while randomizing:
+
+    * the four doorway centres (independently on the north/south dividers) and
+      their widths (always >= :data:`_MIN_DOORWAY_M`);
+    * the four storage-shelf placements (x, y and half-length within their room);
+    * 2-3 object spots per room (>= 0.5 m wall clearance, >= 0.8 m apart);
+    * the 2x2 m delivery pad position within storage B.
+
+    Every candidate must pass :func:`validate_rooms_layout` AND the sec-5b
+    plan-reachability gate (:func:`_all_pairs_reachable`): every bay routes to
+    every object spot and the delivery pad at BOTH 0.40 m and 0.45 m inflation.
+    Deterministic given ``rng`` (the same seed replays the same layout).
+
+    Args:
+        rng: Caller-owned NumPy generator; advances state.
+        max_attempts: Cap on full resample attempts before giving up.
+        enforce_reachable: Run the 0.40/0.45 m reachability gate (default True;
+            disable only for fast geometry-only unit tests).
+
+    Returns:
+        A validated, plan-reachable :class:`WarehouseLayout` with ``rooms`` set.
+
+    Raises:
+        RuntimeError: If no valid + reachable layout is found in ``max_attempts``
+            attempts (message includes the most recent rejection diagnostics).
+    """
+    rooms = _rooms_boxes()
+    seed_tag = int(rng.integers(0, 1_000_000))
+    diagnostics: List[str] = []
+    for attempt in range(max_attempts):
+        walls = _sampled_room_walls(rng)
+        zones, spawns = _sampled_room_zones_and_spawns(rng)
+        probe = WarehouseLayout(
+            hall_x=_ROOMS_HALL_X, hall_y=_ROOMS_HALL_Y, walls=walls, zones=zones,
+            spawn_poses=spawns, object_spots=[], rooms=rooms)
+        spots = _sampled_room_spots(rng, walls, zones[0], rooms, probe)
+        if spots is None:
+            diagnostics.append(f"attempt {attempt}: could not place per-room spots")
+            continue
+        layout = WarehouseLayout(
+            hall_x=_ROOMS_HALL_X, hall_y=_ROOMS_HALL_Y, walls=walls, zones=zones,
+            spawn_poses=spawns, object_spots=spots, rooms=rooms,
+            name=f"sample_rooms_{seed_tag}")
+        try:
+            validate_rooms_layout(layout)
+        except ValueError as e:
+            diagnostics.append(f"attempt {attempt}: invalid geometry: {e}")
+            continue
+        if enforce_reachable:
+            ok, diag = _all_pairs_reachable(layout)
+            if not ok:
+                diagnostics.append(f"attempt {attempt}: unreachable: {diag}")
+                continue
+        return layout
+    raise RuntimeError(
+        f"sample_rooms_layout: no valid+reachable layout in {max_attempts} "
+        f"attempts (seed_tag={seed_tag}); last diagnostics: {diagnostics[-6:]}"
+    )

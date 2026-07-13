@@ -213,6 +213,24 @@ sees it → addressed query + handoff · **C** hidden from all → delegated reg
 | VLA locomotion nav gate | **30/30**, 0 falls | hero **20/20** (2 seeds) + rooms **10/10**, path eff ≥ 0.994 |
 | VLA policy inference | **1.6–1.7 ms/step** | on GPU |
 
+### Generalization — 384 missions on 16 never-seen randomized layouts
+
+Both layout families have seeded samplers (`sample_layout`, `sample_rooms_layout`)
+that self-validate and A\*-verify every bay→spot/pad pair at 0.40 **and** 0.45 m
+inflation before any mission runs (`code/fleet/gen_eval.py`, 8 layouts × 3 mission
+seeds × both stacks per family):
+
+| Layout family (randomized) | Stack | Fetch success (A–C) | Allocator (D) | Falls |
+|---|---|---|---|---|
+| 4-room, 8 sampled layouts | full learned (fine-tuned detector + VLA) | **71/72 (98.6%)** | 24/24 | 0 |
+| 4-room, 8 sampled layouts | oracle + teacher baseline | 72/72 | 24/24 | 0 |
+| hero hall, 8 sampled layouts | full learned | **71/72 (98.6%)** | 24/24 | 1 |
+| hero hall, 8 sampled layouts | oracle + teacher baseline | 72/72 | 24/24 | 0 |
+
+The two learned-stack misses are isolated and diagnosed (one long-range
+doorway-framed detector mislocalization at ~6.2 m; one walk-policy fall —
+0.5% of learned missions), not systematic map failures.
+
 ### Warehouse GROUND_NET detector — before vs after the domain fine-tune
 
 | Metric (on oracle-visible frames) | Playground checkpoint | Warehouse fine-tune |

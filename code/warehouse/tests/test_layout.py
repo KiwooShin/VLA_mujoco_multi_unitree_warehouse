@@ -11,6 +11,7 @@ from code.warehouse.layout import (
     Zone,
     WallSpec,
     WarehouseLayout,
+    _all_pairs_reachable,
     _partition_walls,
     _perimeter_walls,
     _point_rect_distance,
@@ -219,6 +220,25 @@ class TestSampleLayout(unittest.TestCase):
             for s in range(5)
         )
         self.assertTrue(differs)
+
+    def test_gated_samples_are_plan_reachable(self) -> None:
+        # docs/multi_plan.md sec 5b: the default gate rejects any draw whose
+        # jitter seals a spot (e.g. the NE alcove) at 0.40/0.45 m inflation.
+        for seed in (0, 3, 8):  # 3 & 8 are ungated-unreachable draws
+            layout = sample_layout(np.random.default_rng(seed))
+            ok, diag = _all_pairs_reachable(layout)
+            self.assertTrue(ok, f"seed {seed} not reachable: {diag}")
+
+    def test_enforce_reachable_flag_skips_gate(self) -> None:
+        # The fast geometry-only path still returns a validate_layout-clean map.
+        layout = sample_layout(np.random.default_rng(8), enforce_reachable=False)
+        validate_layout(layout)
+        self.assertEqual(len(layout.object_spots), 8)
+
+    def test_gate_still_deterministic(self) -> None:
+        a = sample_layout(np.random.default_rng(8))
+        b = sample_layout(np.random.default_rng(8))
+        self.assertEqual(a.object_spots, b.object_spots)
 
 
 if __name__ == "__main__":

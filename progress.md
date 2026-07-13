@@ -211,3 +211,59 @@ analysis / performance table).
 | Allocator optimality | 3/3 | vs A* argmin ground truth |
 | Fresh-clone rehearsal | 6/6 commands pass | VR-1 rule |
 | Gallery footprint | ~7 MB committed | reel 2.8 MB + GIF 1.8 MB |
+
+---
+
+## 2026-07-12 22:30 — Final-demo features F1-F4/F6 + learned stack (entry 5)
+
+User specified final-demo requirements F1-F6 (docs/final_demo_spec.md) at
+~21:10; five of six are DONE and pushed; F5 (VLA locomotion) is training.
+
+### Done (last ~1.7 h)
+- **Cycle 2b (web demo, ad0e206)**: code/apps/fleet_web — live browser
+  dashboard (MJPEG BEV, status chips, live transcript, command box with
+  friendly validation, sequential queue). Live rehearsal: addressed fetch
+  27 s; queued fleet order allocated to path-shortest robot. 42→43 tests.
+- **F6 (rooms layout, 8fa1782)**: 20×14 m, four named rooms (loading/
+  storage A/storage B/back room), four 2.0 m doorways in a cycle, solid
+  A|B divider; Room/room_of API = single source of truth for search
+  regions AND spoken room names. 44/44 reachability at 0.40/0.45. 22 tests.
+- **F5-p1 (datagen, 821b06f)**: 200-ep/125k-frame warehouse DART dataset,
+  0.985 success, action distribution matches original; validated via both
+  baseline loaders + real-trainer overfit gate. Found+fixed conda EGL
+  vendor shadowing (llvmpipe 160 ms/frame → 0.88 ms GPU, 190×).
+- **Cycle 2a (GROUND_NET, 72eeb54)**: real detector in the mission loop —
+  per-robot GroundNetState (singleton cross-contamination regression-
+  tested), shared weights, geometry-consistency confirm gate, heatmap
+  insets on video. groundnet missions 12/12, 0 falls, 1567 confirmations.
+  HONEST finding: warehouse domain shift collapses detector confidence
+  (geometry stays 0.03-0.13 m accurate) → warehouse det fine-tune queued.
+- **F1-F4 batch (4d7b43b)**: comm-emphasized ego insets; deferred target
+  ring at REPORTED position; exact relative-position sentence ("I am robot
+  Bravo, currently in storage A at position (-4.0, 2.8). The object is
+  located -5.0 m and 3.2 m away from me."); generic fleet commands
+  ("someone bring the object"); room-aware search through doorways
+  (rooms eval C 9/9, D 3/3, 0 falls); MissionRunner lifecycle API
+  (fleet_web now reuses one runner). Frame-verified rooms scenario-C and
+  generic-command draft videos in ops/f14/.
+- **F5-p2 (in flight)**: fine-tune from deployed baseline ckpt on the
+  warehouse DART set — training on GPU (50-65% util), epoch 8+/20,
+  checkpoints saving; closed-loop selection + teacher|vla backend next.
+
+### Next 2 hours
+- VLA training completes → closed-loop checkpoint selection → vla backend
+  gate (hero + rooms, ≥90%, 0 falls) → commit.
+- GROUND_NET warehouse fine-tune (det dataset gen + train) once the GPU
+  frees; re-run perception_eval (expect confidence recovery).
+- Then final demo videos (rooms + VLA locomotion + all F-features).
+
+### Performance
+| Metric | Value | Notes |
+|---|---|---|
+| Rooms missions (search class C) | 9/9 | room-to-room exploration |
+| Rooms allocator (D) | 3/3 | A* argmin verified |
+| Hero regression after F1-F4 | 6/6 + 3/3 | unchanged |
+| GROUND_NET in-loop | 12/12, 1567 confirms | geometry gate, 0 through-wall FP in-mission |
+| Warehouse DART dataset | 200 eps / 125,683 fr | 98.5% ep success |
+| Datagen render | 0.88 ms/frame GPU | was 160 ms on llvmpipe |
+| Suites | comms 52, fleet 120, fleet_web 43, warehouse 86 | + warehouse_demo 39 |

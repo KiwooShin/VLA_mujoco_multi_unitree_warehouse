@@ -89,6 +89,10 @@ class RobotUnit:
         params: Optional[NavParams] = None,
         teacher: Optional[WBCTeacher] = None,
         use_gpu: bool = True,
+        locomotion: str = "teacher",
+        vla_ckpt: Optional[str] = None,
+        vla_device: Optional[str] = None,
+        vla_backend: Optional[object] = None,
     ) -> None:
         """Build the robot's own physics, spawn it and run the settle phase.
 
@@ -99,18 +103,48 @@ class RobotUnit:
             spawn_yaw: Spawn yaw (rad).
             params: Navigation tunables (defaults used if None).
             teacher: Optional pre-loaded :class:`WBCTeacher` to own; a fresh one
-                is created if None.
+                is created if None. The WBC teacher runs the shared settle phase
+                in BOTH locomotion modes (F5).
             use_gpu: Prefer CUDA for the fresh teacher's ONNX session.
+            locomotion: ``"teacher"`` (default; the WBC walk policy drives every
+                step — unchanged behaviour for all existing evals) or ``"vla"``
+                (F5: the trained GroundedNav policy drives locomotion once the
+                robot has settled).
+            vla_ckpt: GroundedNav checkpoint path (``locomotion="vla"``); None
+                resolves the F5 default via
+                :func:`code.fleet.locomotion.resolve_vla_ckpt`.
+            vla_device: Torch device for the VLA policy ('cuda'|'cpu'|None auto).
+            vla_backend: A pre-built per-unit ``VlaBackend`` sharing the fleet's
+                one loaded policy model (injected by :class:`~code.fleet.fleet.
+                Fleet`); when None one is created from the process-wide shared
+                policy, so several units still share ONE model.
+
+        Raises:
+            ValueError: If ``locomotion`` is not ``"teacher"``/``"vla"``.
+            FileNotFoundError: If ``locomotion="vla"`` and the resolved
+                checkpoint file is missing.
         """
+        if locomotion not in ("teacher", "vla"):
+            raise ValueError(
+                f"locomotion must be 'teacher' or 'vla'; got {locomotion!r}")
         self.name = name
         self.spawn_xy: Point = (float(spawn_xy[0]), float(spawn_xy[1]))
         self.spawn_yaw = float(spawn_yaw)
+        self.locomotion = locomotion
         self.goal_xy: Optional[Point] = None
         self.plan_ok: Optional[bool] = None
 
         teacher = teacher or WBCTeacher(use_gpu=use_gpu)
+        # In VLA mode the nav is built teacher-mode (its WBC settle runs), then
+        # switched onto the shared trained policy — so the ~90 MB weights are
+        # never reloaded per robot (the fleet shares ONE model).
         self._nav = StepwiseNav(scene_cfg, self.spawn_xy, self.spawn_yaw,
                                 teacher, params)
+        if locomotion == "vla":
+            from code.fleet.locomotion import (attach_vla_to_nav,
+                                               make_unit_vla_backend)
+            backend = vla_backend or make_unit_vla_backend(vla_ckpt, vla_device)
+            attach_vla_to_nav(self._nav, backend)
         self.state = RobotState.FALLEN if self._nav.fell else RobotState.IDLE
 
     # ---- Goal assignment ----
@@ -164,10 +198,36 @@ class RobotUnit:
         """
         hold = paused or self.state in (
             RobotState.ARRIVED, RobotState.FALLEN, RobotState.IDLE)
+        if self.locomotion == "vla":
+            self._select_hold_backend(hold)
         info = self._nav.step(hold=hold)
         self.state = advance_state(self.state, fell=info.fell, done=info.done,
                                    paused=paused)
         return info
+
+    def _select_hold_backend(self, hold: bool) -> None:
+        """Pick the backend for this step under VLA locomotion (F5).
+
+        The trained VLA policy drives every step the robot actually WALKS, but a
+        zero-velocity hold (idle after a search, arrived at goal, or a
+        proximity-pause) is a *balance* task, not locomotion: the distilled walk
+        policy — fed a zero command with a still-walking proprio window — slowly
+        topples a robot that has just been walking (measured: pelvis 0.73 -> fall
+        over ~40 steps), whereas the WBC balance controller (which already runs
+        the settle phase in both modes) holds a stand indefinitely. So held steps
+        run on the WBC and active walking runs on the VLA. On each hold -> walk
+        resume the VLA proprio window is re-primed from the current standing pose
+        so the GRU restarts from a clean, in-distribution stand rather than a
+        stale window frozen across the hold. All visible room-to-room locomotion
+        is therefore VLA-driven; only standing-in-place is balanced by the WBC.
+        """
+        nav = self._nav
+        if hold:
+            nav.backend = "teacher"
+        elif nav.backend != "vla":
+            nav.backend = "vla"
+            if not nav.fell and nav.vla is not None:
+                nav.vla.reset(nav.teacher.data, nav.teacher._target_dof)
 
     # ---- Read-only state ----
     @property
@@ -239,6 +299,12 @@ class RobotUnit:
     def wall_collision(self) -> bool:
         """True if any robot geom has contacted a wall geom."""
         return self._nav.wall_collision
+
+    @property
+    def vla_infer_ms(self) -> float:
+        """Mean VLA policy forward-pass time (ms); 0.0 in teacher mode / unused."""
+        vla = getattr(self._nav, "vla", None)
+        return float(vla.mean_infer_ms) if vla is not None else 0.0
 
     def distance_to_goal(self) -> float:
         """Straight-line distance from the pelvis to the goal (m); inf if none."""

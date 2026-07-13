@@ -75,21 +75,21 @@ def _run(cmd: List[str]) -> None:
                            f"{res.stderr[-1500:]}")
 
 
-def compress(seg: Segment) -> Path:
-    """H264-compress one hero clip into the gallery (crf 28, yuv420p, faststart)."""
+def compress(seg: Segment, src_dir: Path = _HERO) -> Path:
+    """H264-compress one clip into the gallery (crf 28, yuv420p, faststart)."""
     out = _GALLERY / f"{seg.name}.mp4"
-    _run([_FFMPEG, "-y", "-i", str(_HERO / f"{seg.src}.mp4"),
+    _run([_FFMPEG, "-y", "-i", str(src_dir / f"{seg.src}.mp4"),
           "-c:v", "libx264", "-crf", _CRF, "-preset", "slow",
           "-pix_fmt", "yuv420p", "-movflags", "+faststart",
           str(out), "-loglevel", "error"])
     return out
 
 
-def poster(seg: Segment) -> Path:
+def poster(seg: Segment, src_dir: Path = _HERO) -> Path:
     """Extract the best single frame of a clip as its poster PNG."""
     out = _GALLERY / f"{seg.name}_poster.png"
     _run([_FFMPEG, "-y", "-ss", f"{seg.poster_t}",
-          "-i", str(_HERO / f"{seg.src}.mp4"),
+          "-i", str(src_dir / f"{seg.src}.mp4"),
           "-frames:v", "1", str(out), "-loglevel", "error"])
     return out
 
@@ -110,27 +110,28 @@ def _title_card(seg: Segment) -> Path:
     return path
 
 
-def build_reel() -> Path:
-    """Concatenate the four clips behind 1 s title cards into hero_reel.mp4."""
+def build_reel(segments: List[Segment] = _SEGMENTS, src_dir: Path = _HERO,
+               out_name: str = "hero_reel.mp4") -> Path:
+    """Concatenate the clips behind 1 s title cards into a title-carded reel."""
     _TMP.mkdir(parents=True, exist_ok=True)
     inputs: List[str] = []
     norm: List[str] = []
     idx = 0
-    for seg in _SEGMENTS:
+    for seg in segments:
         card = _title_card(seg)
         inputs += ["-loop", "1", "-t", "1", "-i", str(card)]
         norm.append(f"[{idx}:v]scale={_REEL_W}:{_REEL_H}:force_original_aspect_"
                     f"ratio=decrease,pad={_REEL_W}:{_REEL_H}:(ow-iw)/2:(oh-ih)/2,"
                     f"setsar=1,fps=30[v{idx}]")
         idx += 1
-        inputs += ["-i", str(_HERO / f"{seg.src}.mp4")]
+        inputs += ["-i", str(src_dir / f"{seg.src}.mp4")]
         norm.append(f"[{idx}:v]scale={_REEL_W}:{_REEL_H}:force_original_aspect_"
                     f"ratio=decrease,pad={_REEL_W}:{_REEL_H}:(ow-iw)/2:(oh-ih)/2,"
                     f"setsar=1,fps=30[v{idx}]")
         idx += 1
     concat = "".join(f"[v{i}]" for i in range(idx)) + f"concat=n={idx}:v=1:a=0[out]"
     filt = ";".join(norm) + ";" + concat
-    out = _GALLERY / "hero_reel.mp4"
+    out = _GALLERY / out_name
     _run([_FFMPEG, "-y", *inputs, "-filter_complex", filt, "-map", "[out]",
           "-c:v", "libx264", "-crf", _CRF, "-preset", "slow",
           "-pix_fmt", "yuv420p", "-movflags", "+faststart",
@@ -147,21 +148,22 @@ _GIF_SS, _GIF_DUR = 40.0, 16.0   # window (seconds) into the source clip
 _GIF_W, _GIF_FPS = 760, 12       # output width (px) and frame rate
 
 
-def make_gif() -> Path:
+def make_gif(src: Path = _HERO / f"{_GIF_SRC}.mp4", out_name: str = _GIF_OUT,
+             ss: float = _GIF_SS, dur: float = _GIF_DUR,
+             palette_name: str = "mission_c_palette.png") -> Path:
     """Render the inline-motion GIF via a two-pass palettegen/paletteuse.
 
     A per-clip optimized 256-colour palette (``palettegen``) plus rectangle-diff
     ``paletteuse`` keeps the flat-shaded warehouse render crisp at a fraction of
     a naive GIF's size.
     """
-    src = _HERO / f"{_GIF_SRC}.mp4"
-    palette = _TMP / "mission_c_palette.png"
-    out = _GALLERY / _GIF_OUT
+    palette = _TMP / palette_name
+    out = _GALLERY / out_name
     scale = f"scale={_GIF_W}:-1:flags=lanczos"
-    _run([_FFMPEG, "-y", "-ss", f"{_GIF_SS}", "-t", f"{_GIF_DUR}", "-i", str(src),
+    _run([_FFMPEG, "-y", "-ss", f"{ss}", "-t", f"{dur}", "-i", str(src),
           "-vf", f"fps={_GIF_FPS},{scale},palettegen=stats_mode=diff",
           str(palette), "-loglevel", "error"])
-    _run([_FFMPEG, "-y", "-ss", f"{_GIF_SS}", "-t", f"{_GIF_DUR}", "-i", str(src),
+    _run([_FFMPEG, "-y", "-ss", f"{ss}", "-t", f"{dur}", "-i", str(src),
           "-i", str(palette),
           "-lavfi", f"fps={_GIF_FPS},{scale}[x];"
                     "[x][1:v]paletteuse=dither=bayer:bayer_scale=3:diff_mode=rectangle",
@@ -169,11 +171,64 @@ def make_gif() -> Path:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Final-demo gallery (F1-F6: rooms layout, GROUND_NET perception, VLA
+# locomotion). Sources the four frame-verified originals in ``ops/final/`` and
+# writes the committed ``final_*`` deliverables, regenerating ``hero_reel.mp4``
+# from the FINAL clips and replacing ``mission_c.gif`` from ``final_mission_c``.
+# The four cycle-1 gallery clips (fleet_nav/mission_b/allocator/mission_c) are
+# left in place (they become the "hero-layout" section a later README pass owns).
+# ---------------------------------------------------------------------------
+_FINAL = _REPO / "ops" / "final"
+
+_FINAL_SEGMENTS: List[Segment] = [
+    Segment("fleet_bev", "final_fleet_nav", 10.0,
+            "Fleet Navigation (VLA)", "four robots, cross-room, live proximity pauses"),
+    Segment("mission_B", "final_scenario_b", 4.7,
+            "Peer Visibility Handoff", "a teammate reports the object's relative position"),
+    Segment("mission_F4", "final_generic", 6.0,
+            "Fleet-Addressed Command", "'bring the object' - allocator assigns, first found wins"),
+    Segment("mission_C", "final_mission_c", 33.0,
+            "Collaborative Search and Fetch", "delegated room-to-room search, then deliver"),
+]
+
+# GIF window: the story-dense tail of final_mission_c — the find (F2 ring +
+# F3 report), Alpha's long fetch diagonal, the GROUND_NET heatmap confirmation,
+# the pickup and the start of the carry.
+_FGIF_SS, _FGIF_DUR = 28.5, 16.0
+
+
+def build_final() -> None:
+    """Build the F1-F6 final-demo gallery from ``ops/final/`` originals."""
+    _GALLERY.mkdir(parents=True, exist_ok=True)
+    _TMP.mkdir(parents=True, exist_ok=True)
+    for seg in _FINAL_SEGMENTS:
+        clip = compress(seg, src_dir=_FINAL)
+        pos = poster(seg, src_dir=_FINAL)
+        print(f"[gallery] {clip.name}: {_size_mb(clip):.2f} MB  poster {pos.name}")
+    reel = build_reel(_FINAL_SEGMENTS, src_dir=_FINAL, out_name="hero_reel.mp4")
+    print(f"[gallery] {reel.name}: {_size_mb(reel):.2f} MB  (from the FINAL clips)")
+    gif = make_gif(src=_FINAL / "mission_C.mp4", out_name="mission_c.gif",
+                   ss=_FGIF_SS, dur=_FGIF_DUR,
+                   palette_name="final_mission_c_palette.png")
+    print(f"[gallery] {gif.name}: {_size_mb(gif):.2f} MB  (from final_mission_c)")
+
+
 def _size_mb(path: Path) -> float:
     return path.stat().st_size / 1e6
 
 
-def main() -> None:
+def main(argv: Optional[List[str]] = None) -> None:
+    import argparse
+
+    ap = argparse.ArgumentParser(description="Build the committed gallery assets")
+    ap.add_argument("--final", action="store_true",
+                    help="build the F1-F6 final-demo gallery from ops/final/ "
+                         "(final_* clips, reel + mission_c.gif from the finals)")
+    args = ap.parse_args(argv)
+    if args.final:
+        build_final()
+        return
     _GALLERY.mkdir(parents=True, exist_ok=True)
     _TMP.mkdir(parents=True, exist_ok=True)
     for seg in _SEGMENTS:

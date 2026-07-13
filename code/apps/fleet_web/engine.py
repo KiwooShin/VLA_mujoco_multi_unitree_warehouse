@@ -114,7 +114,9 @@ class MujocoFleetEngine(SimEngine):
     """The real EGL-backed engine over one long-lived ``MissionRunner``."""
 
     def __init__(self, *, seed: int = 0, use_gpu: bool = True,
-                 layout_name: str = "hero") -> None:
+                 layout_name: str = "hero", locomotion: str = "teacher",
+                 vla_ckpt: Optional[str] = None,
+                 vla_device: Optional[str] = None) -> None:
         """Configure the engine (no MuJoCo work until :meth:`reset`).
 
         Args:
@@ -122,10 +124,19 @@ class MujocoFleetEngine(SimEngine):
                 incidental placement); fixed for a reproducible demo scene.
             use_gpu: Prefer CUDA for the walk policies.
             layout_name: Warehouse layout ("hero" is the only tuned layout).
+            locomotion: ``"teacher"`` (default; WBC walk policy) or ``"vla"``
+                (F5: the trained GroundedNav policy, one model shared by the
+                fleet) — passed straight through to the ``MissionRunner``.
+            vla_ckpt: GroundedNav checkpoint for ``locomotion="vla"`` (None -> F5
+                default).
+            vla_device: Torch device for the VLA policy (None -> auto).
         """
         self._seed = int(seed)
         self._use_gpu = bool(use_gpu)
         self._layout_name = layout_name
+        self._locomotion = locomotion
+        self._vla_ckpt = vla_ckpt
+        self._vla_device = vla_device
         self._teachers = None
         self._runner = None
         self._cam = None
@@ -170,7 +181,9 @@ class MujocoFleetEngine(SimEngine):
         old = self._runner
         self._runner = MissionRunner(
             layout=self._layout, objects=self._build_objects(),
-            teachers=self._teachers, seed=self._seed, use_gpu=self._use_gpu)
+            teachers=self._teachers, seed=self._seed, use_gpu=self._use_gpu,
+            locomotion=self._locomotion, vla_ckpt=self._vla_ckpt,
+            vla_device=self._vla_device)
         if old is not None:
             old.close()
         viz = self._runner.fleet.viz

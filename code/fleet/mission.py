@@ -119,6 +119,7 @@ class MissionResult:
     any_fell: bool
     object_on_pad: bool
     task_complete_sent: bool
+    mean_vla_infer_ms: float = 0.0  # F5 locomotion step cost (0.0 in teacher mode)
 
 
 class MissionRunner:
@@ -132,7 +133,10 @@ class MissionRunner:
                  search_deadline_steps: int = 6000,
                  vis_cfg: Optional[VisibilityConfig] = None,
                  regions: Optional[Sequence[str]] = None,
-                 perception_mode: str = "oracle") -> None:
+                 perception_mode: str = "oracle",
+                 locomotion: str = "teacher",
+                 vla_ckpt: Optional[str] = None,
+                 vla_device: Optional[str] = None) -> None:
         """Build the fleet, bus, per-robot protocols/bridges and carry manager.
 
         Args:
@@ -154,6 +158,12 @@ class MissionRunner:
                 evals) or ``"groundnet"`` (the real learned detector CONFIRMS each
                 oracle-visible sighting and refines the reported location). The
                 protocol and message flow are identical in both modes.
+            locomotion: ``"teacher"`` (default; WBC walk policy) or ``"vla"``
+                (F5: the trained GroundedNav policy, one model shared by the whole
+                fleet). Unchanged mission logic in both modes.
+            vla_ckpt: GroundedNav checkpoint (``locomotion="vla"``; None -> F5
+                default).
+            vla_device: Torch device for the shared VLA policy (None -> auto).
         """
         self.layout = layout or hero_layout()
         self.callsigns: List[str] = list(callsigns)
@@ -163,10 +173,12 @@ class MissionRunner:
                          else search_regions_for_layout(self.layout))
         self._rooms = tuple(self.layout.rooms)
         self.perception_mode = perception_mode
+        self.locomotion = locomotion
 
         self.fleet = Fleet(self.layout, goals={}, callsigns=self.callsigns,
                            use_gpu=use_gpu, teachers=teachers, build_viz=True,
-                           seed=seed, objects=objects)
+                           seed=seed, objects=objects, locomotion=locomotion,
+                           vla_ckpt=vla_ckpt, vla_device=vla_device)
         self.scene_cfg = self.fleet.scene_cfg
         self._dest_name, self._dest_xy = delivery_xy(self.layout)
 
@@ -535,7 +547,8 @@ class MissionRunner:
         return MissionResult(
             outcome=outcome, owner=self.primary_owner, steps=self._steps,
             any_fell=self.fleet.any_fell, object_on_pad=self.object_on_pad(),
-            task_complete_sent=complete)
+            task_complete_sent=complete,
+            mean_vla_infer_ms=self.fleet.mean_vla_infer_ms())
 
     # -- deferred target symbol (F2) --------------------------------------
     def _update_target_knowledge(self) -> None:

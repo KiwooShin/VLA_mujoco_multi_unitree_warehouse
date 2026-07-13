@@ -134,14 +134,18 @@ def _independent_allocation(layout: WarehouseLayout, cfg: dict,
 
 def run_mission(klass: str, seed: int, layout: WarehouseLayout, spot: int,
                 teachers: Dict[str, WBCTeacher], max_steps: int,
-                perception_mode: str = "oracle") -> dict:
+                perception_mode: str = "oracle",
+                locomotion: str = "teacher",
+                vla_ckpt: Optional[str] = None,
+                vla_device: Optional[str] = None) -> dict:
     """Run one mission of a class and return its metrics dict."""
     objs = build_objects(layout, spot, seed)
     vis = VisibilityConfig()
     t0 = time.time()
     mr = MissionRunner(layout=layout, objects=objs, teachers=teachers,
                        use_gpu=True, search_deadline_steps=max_steps,
-                       perception_mode=perception_mode)
+                       perception_mode=perception_mode, locomotion=locomotion,
+                       vla_ckpt=vla_ckpt, vla_device=vla_device)
     if klass == "D":
         gt_winner, gt_costs = _independent_allocation(
             layout, mr.scene_cfg, ObjectQuery("red", "cube"), vis,
@@ -168,7 +172,9 @@ def run_mission(klass: str, seed: int, layout: WarehouseLayout, spot: int,
         "finder": found[0].sender if found else None,
         "found_step": found[0].t_step if found else None,
         "perception_mode": perception_mode,
+        "locomotion": locomotion,
         "n_confirmations": len(mr.confirmations),
+        "mean_vla_infer_ms": round(res.mean_vla_infer_ms, 3),
         "time_s": round(elapsed, 1),
     }
     if klass == "D":
@@ -202,24 +208,30 @@ def _plan(seeds: int) -> List[Tuple[str, int, int]]:
 def _rooms_plan(seeds: int) -> List[Tuple[str, int, int]]:
     """Build the (class, seed, spot) plan for the multi-room layout (F6).
 
-    Every rooms spot is hidden from the fleet's bays (all class C), so each
-    searchable-room spot (storage A/B + back room; the fleet's own loading room
-    is not a search target) is one class-C room-to-room search mission. Three
+    Every rooms spot is hidden from the fleet's bays (all class C: full
+    room-to-room delegated search), so — mirroring the hero plan's ``3*seeds``
+    A/B/C shape — this yields ``3*seeds`` class-C searches, cycling deterministically
+    through the searchable-room spots (storage A/B + back room; the fleet's own
+    loading room is not a search target) with a distinct seed per seed-block. Three
     fleet-addressed (D) allocations round it out.
     """
     layout = rooms_layout()
     regions = search_regions_for_layout(layout)
     searchable = [i for i, (x, y) in enumerate(layout.object_spots)
                   if region_name_for_xy(layout, (x, y)) in regions]
-    plan: List[Tuple[str, int, int]] = [("C", j, spot)
-                                        for j, spot in enumerate(searchable)]
+    plan: List[Tuple[str, int, int]] = []
+    for k in range(seeds):
+        for j in range(3):
+            plan.append(("C", k, searchable[(3 * k + j) % len(searchable)]))
     for j in range(3):
         plan.append(("D", 100 + j, searchable[j % len(searchable)]))
     return plan
 
 
 def run_eval(seeds: int, out_dir: str, max_steps: int,
-             perception_mode: str = "oracle", layout_name: str = "hero") -> dict:
+             perception_mode: str = "oracle", layout_name: str = "hero",
+             locomotion: str = "teacher", vla_ckpt: Optional[str] = None,
+             vla_device: Optional[str] = None) -> dict:
     """Run the full mission suite, write JSON, print the table."""
     os.makedirs(out_dir, exist_ok=True)
     layout = _LAYOUTS.get(layout_name, hero_layout)()
@@ -230,7 +242,8 @@ def run_eval(seeds: int, out_dir: str, max_steps: int,
     t0 = time.time()
     for idx, (klass, seed, spot) in enumerate(plan):
         r = run_mission(klass, seed, layout, spot, teachers, max_steps,
-                        perception_mode=perception_mode)
+                        perception_mode=perception_mode, locomotion=locomotion,
+                        vla_ckpt=vla_ckpt, vla_device=vla_device)
         results.append(r)
         with open(os.path.join(out_dir, f"mission_{idx:02d}_{klass}.json"), "w") as f:
             json.dump(r, f, indent=2)
@@ -251,9 +264,12 @@ def _summarize(results: List[dict], elapsed: float) -> dict:
         pc = per_class.setdefault(r["class"], {"n": 0, "ok": 0})
         pc["n"] += 1
         pc["ok"] += int(r["success"])
+    infer = [r["mean_vla_infer_ms"] for r in results
+             if r.get("mean_vla_infer_ms", 0.0) > 0.0]
     return {
         "n_missions": len(results),
         "perception_mode": results[0].get("perception_mode", "oracle") if results else "oracle",
+        "locomotion": results[0].get("locomotion", "teacher") if results else "teacher",
         "ac_success": sum(r["success"] for r in ac),
         "ac_total": len(ac),
         "per_class": per_class,
@@ -261,6 +277,7 @@ def _summarize(results: List[dict], elapsed: float) -> dict:
         "d_total": len(d),
         "n_falls": sum(r["any_fell"] for r in results),
         "n_confirmations": sum(r.get("n_confirmations", 0) for r in results),
+        "mean_vla_infer_ms": round(sum(infer) / len(infer), 3) if infer else 0.0,
         "total_time_s": round(elapsed, 1),
     }
 
@@ -278,15 +295,19 @@ def _print_mission(idx: int, r: dict) -> None:
 
 def _print_summary(s: dict, out_dir: str) -> None:
     print("\n" + "=" * 72)
-    print(f"MISSION EVAL  (perception_mode={s.get('perception_mode', 'oracle')})")
+    print(f"MISSION EVAL  (perception_mode={s.get('perception_mode', 'oracle')}  "
+          f"locomotion={s.get('locomotion', 'teacher')})")
     print("-" * 72)
     for klass, pc in sorted(s["per_class"].items()):
         print(f"  class {klass}: {pc['ok']}/{pc['n']} success")
+    tgt = max(1, round(0.83 * s['ac_total']))
     print(f"  A-C combined: {s['ac_success']}/{s['ac_total']} "
-          f"(target >= 8/10)")
+          f"(target >= {tgt}/{s['ac_total']})")
     print(f"  D allocations correct: {s['d_correct']}/{s['d_total']} (target 3/3)")
     print(f"  falls: {s['n_falls']}   detector confirmations: "
-          f"{s.get('n_confirmations', 0)}   time: {s['total_time_s']}s")
+          f"{s.get('n_confirmations', 0)}   "
+          f"mean VLA infer: {s.get('mean_vla_infer_ms', 0.0)} ms   "
+          f"time: {s['total_time_s']}s")
     print(f"  artifacts: {out_dir}/")
     print("=" * 72, flush=True)
 
@@ -301,9 +322,16 @@ def main(argv: Optional[List[str]] = None) -> None:
                     default="oracle", help="visibility backend for can_see")
     ap.add_argument("--layout", choices=tuple(_LAYOUTS), default="hero",
                     help="hero thirds or the multi-room rooms_layout (F6)")
+    ap.add_argument("--locomotion", choices=("teacher", "vla"), default="teacher",
+                    help="WBC walk policy (default) or the trained VLA policy (F5)")
+    ap.add_argument("--ckpt", type=str, default=None,
+                    help="GroundedNav checkpoint for --locomotion vla (default: F5 fine-tune)")
+    ap.add_argument("--device", type=str, default=None,
+                    help="Torch device for the VLA policy (cuda|cpu; default auto)")
     args = ap.parse_args(argv)
     run_eval(args.seeds, args.out, args.max_steps,
-             perception_mode=args.perception, layout_name=args.layout)
+             perception_mode=args.perception, layout_name=args.layout,
+             locomotion=args.locomotion, vla_ckpt=args.ckpt, vla_device=args.device)
 
 
 if __name__ == "__main__":

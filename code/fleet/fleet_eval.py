@@ -83,6 +83,8 @@ def sample_crossing_goals(
 def run_trial(
     seed: int, layout: WarehouseLayout, max_steps: int,
     teachers: Dict[str, WBCTeacher], engage: float, release: float,
+    locomotion: str = "teacher", vla_ckpt: Optional[str] = None,
+    vla_device: Optional[str] = None,
 ) -> dict:
     """Run one fleet trial and return its per-robot + fleet metrics dict."""
     callsigns = list(CALLSIGNS)
@@ -91,7 +93,8 @@ def run_trial(
 
     t0 = time.time()
     fleet = Fleet(layout, goals, callsigns=callsigns, build_viz=False,
-                  teachers=teachers, engage=engage, release=release, seed=seed)
+                  teachers=teachers, engage=engage, release=release, seed=seed,
+                  locomotion=locomotion, vla_ckpt=vla_ckpt, vla_device=vla_device)
     fleet.run(max_steps)
     elapsed = time.time() - t0
 
@@ -122,13 +125,16 @@ def run_trial(
         "pause_events": fleet.pause_events,
         "makespan": fleet.makespan,
         "steps": fleet.step_count,
+        "locomotion": locomotion,
+        "mean_vla_infer_ms": round(fleet.mean_vla_infer_ms(), 3),
         "time_s": round(elapsed, 1),
         "robots": robots,
     }
 
 
 def run_eval(n: int, base_seed: int, out_dir: str, max_steps: int,
-             engage: float, release: float) -> dict:
+             engage: float, release: float, locomotion: str = "teacher",
+             vla_ckpt: Optional[str] = None, vla_device: Optional[str] = None) -> dict:
     """Run ``n`` fleet trials, write per-trial + summary JSON, print a table."""
     os.makedirs(out_dir, exist_ok=True)
     layout = hero_layout()
@@ -138,7 +144,9 @@ def run_eval(n: int, base_seed: int, out_dir: str, max_steps: int,
     t0 = time.time()
     for t in range(n):
         seed = base_seed + t
-        trial = run_trial(seed, layout, max_steps, teachers, engage, release)
+        trial = run_trial(seed, layout, max_steps, teachers, engage, release,
+                          locomotion=locomotion, vla_ckpt=vla_ckpt,
+                          vla_device=vla_device)
         trials.append(trial)
         with open(os.path.join(out_dir, f"trial_{t:02d}.json"), "w") as f:
             json.dump(trial, f, indent=2)
@@ -219,8 +227,15 @@ def main(argv: Optional[List[str]] = None) -> None:
     ap.add_argument("--max-steps", type=int, default=2400)
     ap.add_argument("--engage", type=float, default=1.0)
     ap.add_argument("--release", type=float, default=1.2)
+    ap.add_argument("--locomotion", choices=("teacher", "vla"), default="teacher",
+                    help="WBC walk policy (default) or the trained VLA policy (F5)")
+    ap.add_argument("--ckpt", type=str, default=None,
+                    help="GroundedNav checkpoint for --locomotion vla (default: F5 fine-tune)")
+    ap.add_argument("--device", type=str, default=None,
+                    help="Torch device for the VLA policy (cuda|cpu; default auto)")
     args = ap.parse_args(argv)
-    run_eval(args.n, args.seed, args.out, args.max_steps, args.engage, args.release)
+    run_eval(args.n, args.seed, args.out, args.max_steps, args.engage, args.release,
+             locomotion=args.locomotion, vla_ckpt=args.ckpt, vla_device=args.device)
 
 
 if __name__ == "__main__":

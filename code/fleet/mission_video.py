@@ -211,6 +211,12 @@ def draw_overlay(frame: np.ndarray, cam: bevmod.BevCamera, mr: MissionRunner,
     hud = [f"sim time {t * _SIM_DT:5.1f} s   step {t}   {mr.phase()}"]
     if mr.task is not None:
         hud.append(f"task: fetch the {mr.task.query.describe()} -> {mr.task.destination_name}")
+    # F4: pin the fleet allocator's decision so it stays visible for the whole
+    # clip (the bus STATUS_UPDATE that speaks it scrolls off the 12-line panel
+    # within the opening query burst).
+    alloc = getattr(mr, "allocation", None)
+    if alloc is not None:
+        hud.append(f"allocator: {_ascii(alloc.describe())}")
     bevmod.put_hud(frame, hud)
 
 
@@ -341,7 +347,10 @@ def record_mission_video(scenario: str, out_dir: str, *, decimation: int,
                          fps: int, max_steps: int, seed: int,
                          perception_mode: str = "oracle",
                          layout_name: str = "hero",
-                         command: Optional[str] = None) -> Optional[str]:
+                         command: Optional[str] = None,
+                         locomotion: str = "teacher",
+                         vla_ckpt: Optional[str] = None,
+                         vla_device: Optional[str] = None) -> Optional[str]:
     """Run a scenario mission and write the composited MP4. Returns its path."""
     import cv2
 
@@ -350,7 +359,8 @@ def record_mission_video(scenario: str, out_dir: str, *, decimation: int,
     spot = _SCENARIO_SPOT.get(layout_name, {}).get(scenario, 5)
     mr = MissionRunner(layout=layout, objects=_build_objects(spot, layout),
                        seed=seed, use_gpu=True, search_deadline_steps=max_steps,
-                       perception_mode=perception_mode)
+                       perception_mode=perception_mode, locomotion=locomotion,
+                       vla_ckpt=vla_ckpt, vla_device=vla_device)
     viz = mr.fleet.viz
     assert viz is not None
     cam = bevmod.fit_bev_camera(mr.layout.hall_x, mr.layout.hall_y,
@@ -416,11 +426,19 @@ def main(argv: Optional[List[str]] = None) -> None:
     ap.add_argument("--perception", choices=("oracle", "groundnet"),
                     default="oracle",
                     help="groundnet overlays live GROUND_NET detector insets")
+    ap.add_argument("--locomotion", choices=("teacher", "vla"), default="teacher",
+                    help="WBC walk policy (default) or the trained VLA policy (F5)")
+    ap.add_argument("--ckpt", type=str, default=None,
+                    help="GroundedNav checkpoint for --locomotion vla (default: F5 fine-tune)")
+    ap.add_argument("--device", type=str, default=None,
+                    help="Torch device for the VLA policy (cuda|cpu; default auto)")
     args = ap.parse_args(argv)
     record_mission_video(args.scenario, args.out, decimation=args.decimation,
                          fps=args.fps, max_steps=args.max_steps, seed=args.seed,
                          perception_mode=args.perception,
-                         layout_name=args.layout, command=args.command)
+                         layout_name=args.layout, command=args.command,
+                         locomotion=args.locomotion, vla_ckpt=args.ckpt,
+                         vla_device=args.device)
 
 
 if __name__ == "__main__":

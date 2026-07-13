@@ -97,6 +97,9 @@ class Fleet:
         seed: int = 0,
         teachers: Optional[Dict[str, "object"]] = None,
         objects: Optional[List[dict]] = None,
+        locomotion: str = "teacher",
+        vla_ckpt: Optional[str] = None,
+        vla_device: Optional[str] = None,
     ) -> None:
         """Build every robot, assign goals and (optionally) the shared viz model.
 
@@ -117,24 +120,50 @@ class Fleet:
             objects: Explicit scene object list; when None one object per layout
                 spot is sampled from the seeded palettes (Phase-4 missions pass a
                 scenario-specific placement here).
+            locomotion: ``"teacher"`` (default; every robot's WBC walk policy
+                drives locomotion — unchanged behaviour) or ``"vla"`` (F5: the
+                trained GroundedNav policy). All four robots SHARE one loaded
+                policy model (loaded once via
+                :func:`code.fleet.locomotion.load_shared_vla_policy`), each with
+                its own per-robot proprio window.
+            vla_ckpt: GroundedNav checkpoint (``locomotion="vla"``); None resolves
+                the F5 default.
+            vla_device: Torch device for the shared VLA policy (None -> auto).
         """
         self.callsigns: List[str] = list(callsigns)
         self.priorities: Dict[str, int] = {c: i for i, c in enumerate(self.callsigns)}
         self.engage = float(engage)
         self.release = float(release)
+        self.locomotion = locomotion
 
         scene_cfg = warehouse_scene_cfg(
             layout, robot=self.callsigns[0], objects=objects,
             rng=np.random.default_rng(seed))
         self.scene_cfg = scene_cfg
 
+        # F5: load the ONE shared policy up front (fail-fast on a bad checkpoint,
+        # loaded exactly once for the whole fleet) and hand each robot a clone
+        # that references it — one model on the GPU, per-robot proprio windows.
+        shared_vla = None
+        if locomotion == "vla":
+            from code.fleet.locomotion import (load_shared_vla_policy,
+                                               make_unit_vla_backend,
+                                               resolve_vla_ckpt)
+            vla_ckpt = resolve_vla_ckpt(vla_ckpt)
+            shared_vla = load_shared_vla_policy(vla_ckpt, vla_device)
+        self.vla_ckpt = vla_ckpt
+
         teachers = teachers or {}
         self.units: Dict[str, RobotUnit] = {}
         for name in self.callsigns:
             sx, sy, syaw = layout.spawn_poses[name]
+            unit_backend = (make_unit_vla_backend(shared=shared_vla)
+                            if shared_vla is not None else None)
             unit = RobotUnit(name, scene_cfg, (sx, sy), syaw,
                              params=params, teacher=teachers.get(name),
-                             use_gpu=use_gpu)
+                             use_gpu=use_gpu, locomotion=locomotion,
+                             vla_ckpt=vla_ckpt, vla_device=vla_device,
+                             vla_backend=unit_backend)
             if name in goals:
                 unit.assign_goal(goals[name])
             self.units[name] = unit
@@ -225,6 +254,16 @@ class Fleet:
     def statuses(self) -> List[str]:
         """Per-robot status lines (fixed callsign order)."""
         return [self.units[n].status_line() for n in self.callsigns]
+
+    def mean_vla_infer_ms(self) -> float:
+        """Mean VLA policy forward-pass time (ms) across robots (0.0 in teacher mode).
+
+        The step cost of the trained locomotion backend: averaged over every
+        robot that actually ran a forward pass this run. 0.0 when
+        ``locomotion="teacher"`` (no VLA policy) or before any stepping.
+        """
+        vals = [u.vla_infer_ms for u in self.units.values() if u.vla_infer_ms > 0.0]
+        return float(sum(vals) / len(vals)) if vals else 0.0
 
     def close(self) -> None:
         """Release the viz renderers."""

@@ -42,7 +42,9 @@ from code.apps.warehouse_demo import bev as bevmod
 from code.fleet.fleet import Fleet
 from code.fleet.viz import BEV_H, BEV_W, FleetViz
 from code.warehouse.arena import warehouse_scene_cfg
-from code.warehouse.layout import CALLSIGNS, hero_layout
+from code.warehouse.layout import CALLSIGNS, hero_layout, rooms_layout
+
+_LAYOUTS = {"hero": hero_layout, "rooms": rooms_layout}
 
 Point = Tuple[float, float]
 _DEFAULT_OUT = str(_REPO / "ops" / "phase2")
@@ -60,6 +62,15 @@ ACCENT_BGR: Dict[str, Tuple[int, int, int]] = {
 # A crossing goal assignment (spot indices) that reliably produces an aisle
 # interaction for the demo (Alpha east, Delta west; Bravo/Charlie swap north).
 _DEMO_GOALS: Dict[str, int] = {"Alpha": 7, "Bravo": 4, "Charlie": 3, "Delta": 6}
+
+# Per-layout crossing goals. Rooms (F6): every robot leaves its south loading bay
+# and drives cross-room through the open doorways — Alpha east into storage B,
+# Delta west into storage A (they cross the middle), Bravo/Charlie fan into the
+# back room from opposite sides — so paths cross and the proximity pause fires.
+_DEMO_GOALS_BY_LAYOUT: Dict[str, Dict[str, int]] = {
+    "hero": _DEMO_GOALS,
+    "rooms": {"Alpha": 5, "Bravo": 9, "Charlie": 8, "Delta": 2},
+}
 
 
 def _bgr(rgb: np.ndarray) -> np.ndarray:
@@ -100,18 +111,30 @@ def draw_fleet_overlay(frame: np.ndarray, cam: bevmod.BevCamera, fleet: Fleet,
 
 def record_fleet_video(
     out_dir: str, seed: int, max_steps: int, fps: int, decimation: int,
+    layout_name: str = "hero", locomotion: str = "teacher",
+    vla_ckpt: Optional[str] = None, vla_device: Optional[str] = None,
 ) -> Tuple[Optional[str], Fleet]:
     """Record the whole-hall fleet BEV MP4 and return (path, fleet)."""
     import cv2
 
     os.makedirs(out_dir, exist_ok=True)
-    layout = hero_layout()
+    layout = _LAYOUTS.get(layout_name, hero_layout)()
     spots = layout.object_spots
     goals = {cs: (float(spots[i][0]), float(spots[i][1]))
-             for cs, i in _DEMO_GOALS.items()}
-    fleet = Fleet(layout, goals, build_viz=True, seed=seed)
+             for cs, i in _DEMO_GOALS_BY_LAYOUT.get(layout_name, _DEMO_GOALS).items()}
+    fleet = Fleet(layout, goals, build_viz=True, seed=seed, locomotion=locomotion,
+                  vla_ckpt=vla_ckpt, vla_device=vla_device)
     viz = fleet.viz
     assert viz is not None
+    # The shared viz model is display-only (never stepped); robots roam and
+    # transiently overlap in it (esp. crossing paths through rooms doorways), so
+    # disable contact/constraint solving to keep its render-only ``mj_forward``
+    # from tripping FactorizeHessian on a degenerate overlap (same guard the
+    # MissionRunner applies).
+    import mujoco
+    viz.model.opt.disableflags |= (
+        int(mujoco.mjtDisableBit.mjDSBL_CONTACT)
+        | int(mujoco.mjtDisableBit.mjDSBL_CONSTRAINT))
     cam = bevmod.fit_bev_camera(
         layout.hall_x, layout.hall_y, width=BEV_W, height=BEV_H,
         fovy_deg=float(viz.model.vis.global_.fovy))
@@ -233,13 +256,27 @@ def main(argv: Optional[List[str]] = None) -> None:
     ap.add_argument("--decimation", type=int, default=3)
     ap.add_argument("--ego-step", type=int, default=400)
     ap.add_argument("--no-ego-strip", action="store_true")
+    ap.add_argument("--layout", choices=tuple(_LAYOUTS), default="hero",
+                    help="hero hall or the multi-room rooms_layout (F6)")
+    ap.add_argument("--locomotion", choices=("teacher", "vla"), default="teacher",
+                    help="WBC walk policy (default) or the trained VLA policy (F5)")
+    ap.add_argument("--ckpt", type=str, default=None,
+                    help="GroundedNav checkpoint for --locomotion vla (default: F5 fine-tune)")
+    ap.add_argument("--device", type=str, default=None,
+                    help="Torch device for the VLA policy (cuda|cpu; default auto)")
+    ap.add_argument("--video-only", action="store_true",
+                    help="skip the hero-only cross-visibility proof + ego strip")
     args = ap.parse_args(argv)
 
-    cross_visibility_proof(args.out)
+    if not args.video_only and args.layout == "hero":
+        cross_visibility_proof(args.out)
     path, fleet = record_fleet_video(args.out, args.seed, args.max_steps,
-                                     args.fps, args.decimation)
+                                     args.fps, args.decimation,
+                                     layout_name=args.layout,
+                                     locomotion=args.locomotion,
+                                     vla_ckpt=args.ckpt, vla_device=args.device)
     fleet.close()
-    if not args.no_ego_strip:
+    if not args.no_ego_strip and not args.video_only and args.layout == "hero":
         ego_strip(args.out, args.seed, args.ego_step)
 
 

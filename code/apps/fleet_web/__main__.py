@@ -36,6 +36,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="Target rendered-frame rate (sim pace scales with it).")
     ap.add_argument("--no-gpu", action="store_true",
                     help="Force CPU walk policies (slower).")
+    ap.add_argument("--locomotion", choices=("teacher", "vla"), default="teacher",
+                    help="WBC walk policy (default) or the trained VLA policy (F5).")
+    ap.add_argument("--ckpt", type=str, default=None,
+                    help="GroundedNav checkpoint for --locomotion vla (default: F5 fine-tune).")
+    ap.add_argument("--device", type=str, default=None,
+                    help="Torch device for the VLA policy (cuda|cpu; default auto).")
     args = ap.parse_args(argv)
 
     from code.apps.fleet_web.app import create_app
@@ -43,7 +49,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     from code.apps.fleet_web.service import FleetService
 
     engine = MujocoFleetEngine(seed=args.seed, use_gpu=not args.no_gpu,
-                               layout_name=args.layout)
+                               layout_name=args.layout,
+                               locomotion=args.locomotion, vla_ckpt=args.ckpt,
+                               vla_device=args.device)
     service = FleetService(engine, max_steps=args.max_steps,
                            steps_per_frame=args.steps_per_frame,
                            target_fps=args.fps)

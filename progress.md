@@ -394,3 +394,43 @@ User specified final-demo requirements F1-F6 (docs/final_demo_spec.md) at
 | Post-fix seed-6 | 9/9 + 3/3, 0 falls | was 8/9 |
 | Audit findings closed | 12/12 | 3 major (lifecycle/peer-reply/ring) |
 | Test suite | 1516 OK (7 skip) | +27 today |
+
+---
+
+## 2026-07-13 10:00 — Scale-up, reservations verdict, 20-seed reliability (entry 9)
+
+### Done (last ~2 h)
+- **Six-robot scale-up (891b591)**: rooms6 (24×16 m, six bays, 14 spots,
+  2.2 m doorway cycle); roster now layout-derived (callsigns_for_layout);
+  reserve-searcher logic exercised naturally (5 searchers / 3 rooms →
+  2 reserves); comm insets scale at N>4. Fleet nav 5/5 (all six arrive,
+  0 falls); missions C 9/9 + D 3/3 (oracle) and 3/3+3/3 (groundnet).
+  Two six-robot gallery videos + README rows. 6-robot step 3.6-4.0 ms
+  (VLA 13.1 ms) — well under the 20 ms real-time budget. +35 tests.
+- **Space-time reservations (55cd72a)**: full time-expanded A* +
+  reservation table built, tested (+32), integrated behind a default-OFF
+  flag — and MEASURED as a behavioral no-op on these layouts (identical
+  success/pauses/makespan over 10 OFF-vs-ON trials at 4 and 6 robots).
+  Shipped as opt-in with the measurement documented in the README;
+  the simple proximity-pause stays the default. Honest verdict > oversell.
+- **20-seed full-stack reliability**: rooms + groundnet + VLA →
+  **60/60 class-C missions, 3/3 D, 0 falls**, 22,292 detector
+  confirmations, VLA 1.74 ms/step. README headline updated.
+- DECISION: hero-seed-3 walk-policy fall residual (0.5%) stays a
+  documented residual — a retrain would invalidate the validated
+  checkpoint and all published numbers for marginal gain.
+- Final fresh-clone rehearsal running (suite in a clean clone).
+
+### Next
+- Wrap-up: memory + docs sweep, then maintenance mode for the remaining
+  session window (watchdog checks, user requests, no invented churn).
+
+### Performance (final headline set)
+| Metric | Value |
+|---|---|
+| Full-stack missions (20 seeds, rooms) | **60/60 C + 3/3 D, 0 falls** |
+| Generalization (16 unseen layouts) | 142/144 learned / 144/144 baseline |
+| Six-robot fleet | 5/5 all-arrive, 0 falls |
+| VLA nav gate | 30/30, 0 falls, eff ≥0.994 |
+| Detector (warehouse) | det 1.000, conf p50 0.894, 0 valid-pose FPs |
+| Test suite | 1583 OK (7 skip) |

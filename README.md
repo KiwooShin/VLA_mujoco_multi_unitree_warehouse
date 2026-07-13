@@ -224,7 +224,7 @@ sees it → addressed query + handoff · **C** hidden from all → delegated reg
 
 | Capability | Result | Detail |
 |---|---|---|
-| Search-and-fetch missions, class **C** (delegated room-to-room exploration) | **12/12** | rooms layout, groundnet + VLA |
+| Search-and-fetch missions, class **C** (delegated room-to-room exploration) | **60/60** (20 seeds) | rooms layout, groundnet + VLA, 0 falls |
 | Fleet allocator, class **D** (*"someone bring the object"*) | **3/3** optimal | matches an independent A\* argmin |
 | Hero-layout regression (A/B/C + D) | **6/6 + 3/3** | unchanged by the learned stack |
 | Falls across all **24** full-stack missions | **0** | rooms + hero |

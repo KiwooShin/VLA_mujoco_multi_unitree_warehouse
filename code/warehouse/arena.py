@@ -370,7 +370,9 @@ def build_warehouse_arena(scene_cfg: dict) -> mujoco.MjModel:
     except Exception:
         pass
 
-    _add_overhead_lights(wb, 8.0, 6.0)
+    hx = float(scene_cfg.get("hall_x", 16.0)) / 2.0
+    hy = float(scene_cfg.get("hall_y", 12.0)) / 2.0
+    _add_overhead_lights(wb, hx, hy)
     _apply_floor(spec)
 
     model = spec.compile()

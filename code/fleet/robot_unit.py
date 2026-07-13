@@ -138,6 +138,19 @@ class RobotUnit:
             self.state = RobotState.IDLE
         return ok
 
+    def halt(self) -> None:
+        """Abort the current goal and hold in place (search-cancel / stop).
+
+        Clears the underlying plan and returns a walking/paused robot to
+        ``idle``; terminal (arrived/fallen) robots are left untouched. Additive
+        control hook for the Phase-4 search controller — the baseline nav loops
+        never call it.
+        """
+        if self.state in (RobotState.WALKING, RobotState.PAUSED):
+            self._nav.clear_goal()
+            self.goal_xy = None
+            self.state = RobotState.IDLE
+
     # ---- One control step ----
     def step(self, *, paused: bool = False) -> StepInfo:
         """Advance one 50 Hz control step and update the state machine.

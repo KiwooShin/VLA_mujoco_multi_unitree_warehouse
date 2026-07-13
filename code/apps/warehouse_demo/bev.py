@@ -60,7 +60,18 @@ class BevCamera:
     height: int = 480
 
     def _basis(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """Return (eye, forward, right, up) world-frame unit axes + eye pos."""
+        """Return (eye, forward, right, up) world-frame unit axes + eye pos.
+
+        The basis depends only on the frozen framing fields, so it is computed
+        once and cached on the instance (the same lazy-attribute pattern
+        :func:`render_bev` uses for ``_mjv_cache``). This matters: overlay
+        drawing projects thousands of points per frame, and recomputing the
+        trig/cross products per point dominated the Phase-4 mission video
+        render before caching.
+        """
+        cached = getattr(self, "_basis_cache", None)
+        if cached is not None:
+            return cached
         az = math.radians(self.azimuth_deg)
         el = math.radians(self.elevation_deg)
         forward = np.array(
@@ -74,7 +85,9 @@ class BevCamera:
         right = np.cross(forward, world_up)
         right /= np.linalg.norm(right)
         up = np.cross(right, forward)
-        return eye, forward, right, up
+        basis = (eye, forward, right, up)
+        object.__setattr__(self, "_basis_cache", basis)
+        return basis
 
     def project(self, xyz: Sequence[float]) -> Tuple[float, float, float]:
         """Project a world point to pixel coordinates.

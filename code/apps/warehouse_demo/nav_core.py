@@ -318,6 +318,16 @@ class StepwiseNav:
         self.goal_xy = (float(goal_xy[0]), float(goal_xy[1]))
         return True
 
+    def clear_goal(self) -> None:
+        """Drop the current plan so the robot holds in place.
+
+        Used to abort a delegated search mid-patrol (:meth:`RobotUnit.halt`): the
+        follower is discarded so subsequent :meth:`step` calls command zero
+        velocity until a new goal is planned.
+        """
+        self.follower = None
+        self.goal_xy = None
+
     # ---- One control step ----
     def step(self, *, hold: bool = False) -> StepInfo:
         """Advance one 50 Hz control step.

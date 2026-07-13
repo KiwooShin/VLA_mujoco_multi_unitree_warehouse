@@ -96,6 +96,7 @@ class Fleet:
         build_viz: bool = True,
         seed: int = 0,
         teachers: Optional[Dict[str, "object"]] = None,
+        objects: Optional[List[dict]] = None,
     ) -> None:
         """Build every robot, assign goals and (optionally) the shared viz model.
 
@@ -113,6 +114,9 @@ class Fleet:
                 fleets/trials (rebound onto each robot's fresh warehouse model),
                 sparing a per-trial ONNX reload. A fresh teacher is built for any
                 callsign missing here.
+            objects: Explicit scene object list; when None one object per layout
+                spot is sampled from the seeded palettes (Phase-4 missions pass a
+                scenario-specific placement here).
         """
         self.callsigns: List[str] = list(callsigns)
         self.priorities: Dict[str, int] = {c: i for i, c in enumerate(self.callsigns)}
@@ -120,7 +124,8 @@ class Fleet:
         self.release = float(release)
 
         scene_cfg = warehouse_scene_cfg(
-            layout, robot=self.callsigns[0], rng=np.random.default_rng(seed))
+            layout, robot=self.callsigns[0], objects=objects,
+            rng=np.random.default_rng(seed))
         self.scene_cfg = scene_cfg
 
         teachers = teachers or {}

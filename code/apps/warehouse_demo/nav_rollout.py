@@ -87,6 +87,8 @@ class NavResult:
     max_turn_run: int = 0
     planned_path: List[Point] = dataclasses.field(default_factory=list)
     video_path: Optional[str] = None
+    backend: str = "teacher"
+    vla_infer_ms: float = 0.0   # mean policy forward-pass time (ms); 0.0 for teacher
 
     def to_dict(self) -> Dict[str, object]:
         """JSON-serializable view (tuples/lists flattened to plain floats)."""
@@ -96,14 +98,15 @@ class NavResult:
         return d
 
 
-def _fail_result(outcome: str, goal_xy: Point, t0: float, *, fell: bool) -> NavResult:
+def _fail_result(outcome: str, goal_xy: Point, t0: float, *, fell: bool,
+                 backend: str = "teacher") -> NavResult:
     """Build a zero-progress NavResult for a settle-fall or plan failure."""
     return NavResult(
         success=False, outcome=outcome, steps=0,
         path_length_planned=0.0, path_length_walked=0.0,
         path_efficiency=0.0, min_wall_clearance=float("nan"),
         fell=fell, wall_collision=False, time_s=time.time() - t0,
-        goal_xy=(float(goal_xy[0]), float(goal_xy[1])),
+        goal_xy=(float(goal_xy[0]), float(goal_xy[1])), backend=backend,
     )
 
 
@@ -118,6 +121,9 @@ def run_nav_rollout(
     params: Optional[NavParams] = None,
     teacher: Optional[WBCTeacher] = None,
     video_name: Optional[str] = None,
+    backend: str = "teacher",
+    vla_ckpt: Optional[str] = None,
+    vla_device: Optional[str] = None,
 ) -> NavResult:
     """Walk one G1 along an A* path to ``goal_xy`` through the warehouse.
 
@@ -148,12 +154,13 @@ def run_nav_rollout(
 
     rx, ry = scene_cfg["robot_xy"]
     ryaw = float(scene_cfg.get("robot_yaw", 0.0))
-    nav = StepwiseNav(scene_cfg, (rx, ry), ryaw, teacher, params)
+    nav = StepwiseNav(scene_cfg, (rx, ry), ryaw, teacher, params,
+                      backend=backend, vla_ckpt=vla_ckpt, vla_device=vla_device)
     if nav.fell:
-        return _fail_result("fall", goal_xy, t0, fell=True)
+        return _fail_result("fall", goal_xy, t0, fell=True, backend=backend)
 
     if not nav.plan(goal_xy):
-        return _fail_result("plan_failed", goal_xy, t0, fell=False)
+        return _fail_result("plan_failed", goal_xy, t0, fell=False, backend=backend)
     path = nav.planned_path
 
     # ---- Optional BEV video setup ----
@@ -211,7 +218,8 @@ def run_nav_rollout(
         fell=fell, wall_collision=nav.wall_collision, time_s=time.time() - t0,
         goal_xy=(float(goal_xy[0]), float(goal_xy[1])),
         max_turn_run=nav.max_turn_run, planned_path=[tuple(p) for p in path],
-        video_path=video_path,
+        video_path=video_path, backend=backend,
+        vla_infer_ms=(nav.vla.mean_infer_ms if nav.vla is not None else 0.0),
     )
 
 

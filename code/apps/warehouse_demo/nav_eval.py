@@ -33,8 +33,10 @@ if str(_REPO) not in sys.path:
 
 from code.apps.warehouse_demo.nav_rollout import NavParams, NavResult, run_nav_rollout
 from code.sim.teacher import WBCTeacher
-from code.warehouse.layout import CALLSIGNS, hero_layout
+from code.warehouse.layout import CALLSIGNS, hero_layout, rooms_layout
 from code.warehouse.arena import warehouse_scene_cfg
+
+_LAYOUTS = {"hero": hero_layout, "rooms": rooms_layout}
 
 _DEFAULT_OUT = str(_REPO / "eval" / "warehouse_nav")
 
@@ -51,6 +53,8 @@ def sample_episode(
 def run_eval(
     n: int, seed: int, out_dir: str, max_steps: int,
     params: Optional[NavParams] = None, record_video: bool = False,
+    layout_name: str = "hero", backend: str = "teacher",
+    vla_ckpt: Optional[str] = None, vla_device: Optional[str] = None,
 ) -> dict:
     """Run ``n`` navigation episodes and write per-episode + summary JSON.
 
@@ -61,13 +65,20 @@ def run_eval(
         max_steps: Per-episode control-step cap.
         params: Navigation tunables (defaults used if None).
         record_video: If True, also record each episode's BEV MP4 to ``out_dir``.
+        layout_name: 'hero' (single-hall regression) or 'rooms' (multi-room F6:
+            bay->spot goals across open doorways).
+        backend: 'teacher' (WBC walk policy) or 'vla' (trained GroundedNav).
+        vla_ckpt: GroundedNav checkpoint path (required when ``backend='vla'``).
+        vla_device: Torch device for the VLA policy ('cuda'|'cpu'|None → auto).
 
     Returns:
         The summary dict (also written to ``summary.json``).
     """
     params = params or NavParams()
     os.makedirs(out_dir, exist_ok=True)
-    layout = hero_layout()
+    if layout_name not in _LAYOUTS:
+        raise ValueError(f"layout must be one of {list(_LAYOUTS)}; got {layout_name!r}")
+    layout = _LAYOUTS[layout_name]()
     spots = layout.object_spots
     rng = np.random.default_rng(seed)
     teacher = WBCTeacher(use_gpu=True)
@@ -84,6 +95,7 @@ def run_eval(
             cfg, goal_xy, seed=seed + ep, max_steps=max_steps, teacher=teacher,
             params=params, record_video=record_video, out_dir=out_dir,
             video_name=f"ep{ep:02d}_{callsign}",
+            backend=backend, vla_ckpt=vla_ckpt, vla_device=vla_device,
         )
         results.append(res)
         row = res.to_dict()
@@ -93,22 +105,28 @@ def run_eval(
             json.dump(row, f, indent=2)
         print(_fmt_row(ep, callsign, goal_xy, res), flush=True)
 
-    summary = _summarize(rows, results, seed, n, time.time() - t0, params)
+    summary = _summarize(rows, results, seed, n, time.time() - t0, params,
+                         layout_name=layout_name, backend=backend)
     with open(os.path.join(out_dir, "summary.json"), "w") as f:
         json.dump(summary, f, indent=2)
     _print_table(rows, summary, out_dir)
     return summary
 
 
-def _summarize(rows, results, seed, n, elapsed, params) -> dict:
+def _summarize(rows, results, seed, n, elapsed, params,
+               layout_name: str = "hero", backend: str = "teacher") -> dict:
     """Aggregate episode results into a summary dict."""
     succ = [r for r in results if r.success]
     effs = [r.path_efficiency for r in succ]
     clears = [r.min_wall_clearance for r in results
               if r.min_wall_clearance == r.min_wall_clearance]  # drop NaN
+    infer_ms = [r.vla_infer_ms for r in results if r.vla_infer_ms > 0.0]
     return {
         "n": n,
         "seed": seed,
+        "layout": layout_name,
+        "backend": backend,
+        "mean_vla_infer_ms": round(float(np.mean(infer_ms)), 3) if infer_ms else 0.0,
         "n_success": len(succ),
         "success_rate": round(len(succ) / max(1, n), 3),
         "n_fell": sum(1 for r in results if r.fell),
@@ -160,6 +178,9 @@ def _print_table(rows, summary, out_dir) -> None:
     print(f"mean_min_clearance={summary['mean_min_wall_clearance']}m  "
           f"min={summary['min_min_wall_clearance']}m   "
           f"time={summary['total_time_s']}s")
+    print(f"backend={summary.get('backend')}  layout={summary.get('layout')}  "
+          f"mean_steps_success={summary['mean_steps_success']}  "
+          f"vla_infer_ms={summary.get('mean_vla_infer_ms')}")
     print(f"artifacts: {out_dir}/")
     print("=" * 78, flush=True)
 
@@ -172,9 +193,17 @@ def main(argv: Optional[List[str]] = None) -> None:
     ap.add_argument("--out", type=str, default=_DEFAULT_OUT)
     ap.add_argument("--max-steps", type=int, default=2600)
     ap.add_argument("--record-video", action="store_true")
+    ap.add_argument("--layout", type=str, default="hero", choices=list(_LAYOUTS))
+    ap.add_argument("--backend", type=str, default="teacher",
+                    choices=["teacher", "vla"])
+    ap.add_argument("--ckpt", type=str, default=None,
+                    help="GroundedNav checkpoint path (required for --backend vla)")
+    ap.add_argument("--device", type=str, default=None,
+                    help="Torch device for the VLA policy (cuda|cpu; default auto)")
     args = ap.parse_args(argv)
     run_eval(args.n, args.seed, args.out, args.max_steps,
-             record_video=args.record_video)
+             record_video=args.record_video, layout_name=args.layout,
+             backend=args.backend, vla_ckpt=args.ckpt, vla_device=args.device)
 
 
 if __name__ == "__main__":

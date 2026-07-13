@@ -33,7 +33,7 @@ import mujoco
 import numpy as np
 
 from code.apps.warehouse_demo.planning import build_inflated_grid, min_wall_clearance
-from code.control.steer import steer
+from code.control.steer import goal_vec as steer_goal_vec, steer
 from code.planner.astar import PathNotFoundError, path_length, plan_path, shortcut_path
 from code.planner.follower import WaypointFollower
 from code.sim.teacher import SIM_DT, WBCTeacher
@@ -224,6 +224,10 @@ class StepwiseNav:
         spawn_yaw: float,
         teacher: WBCTeacher,
         params: Optional[NavParams] = None,
+        *,
+        backend: str = "teacher",
+        vla_ckpt: Optional[str] = None,
+        vla_device: Optional[str] = None,
     ) -> None:
         """Build the robot's model, rebind the teacher, spawn and settle.
 
@@ -234,8 +238,37 @@ class StepwiseNav:
             teacher: A :class:`WBCTeacher` owned by this navigator; rebound onto
                 the warehouse model here.
             params: Navigation tunables (defaults used if None).
+            backend: Locomotion backend — ``"teacher"`` (default; drives the
+                WBC walk policy, unchanged behaviour) or ``"vla"`` (F5: drives
+                the trained GroundedNav policy, loaded from ``vla_ckpt``). The
+                WBC teacher still runs the settle phase in BOTH modes (the walk
+                policy takes over only after the robot is standing) — matching
+                the warehouse DART datagen recipe.
+            vla_ckpt: Path to the GroundedNav checkpoint (required when
+                ``backend="vla"``).
+            vla_device: Torch device for the VLA policy ('cuda'|'cpu'|None →
+                auto). Ignored for the teacher backend.
+
+        Raises:
+            ValueError: If ``backend`` is not ``"teacher"``/``"vla"``, or if
+                ``backend="vla"`` without a ``vla_ckpt``.
+            FileNotFoundError: If ``backend="vla"`` and ``vla_ckpt`` is missing.
         """
         from code.warehouse.arena import build_warehouse_arena
+
+        if backend not in ("teacher", "vla"):
+            raise ValueError(f"backend must be 'teacher' or 'vla'; got {backend!r}")
+        self.backend = backend
+
+        # ---- VLA backend: load the trained policy FIRST, so a bad backend
+        # string / missing-ckpt path fails fast, before any arena is compiled or
+        # physics is stepped (also makes the validation cheaply unit-testable) ----
+        self.vla = None
+        if backend == "vla":
+            if not vla_ckpt:
+                raise ValueError("backend='vla' requires vla_ckpt (checkpoint path)")
+            from code.apps.warehouse_demo.vla_backend import VlaBackend
+            self.vla = VlaBackend(vla_ckpt, device=vla_device)
 
         self.params = params or NavParams()
         self._scene_cfg = scene_cfg
@@ -254,6 +287,10 @@ class StepwiseNav:
             if teacher.base_height < FALL_HEIGHT:
                 self.fell = True
                 break
+
+        # ---- Prime the VLA proprio window from the settled standing state ----
+        if self.vla is not None and not self.fell:
+            self.vla.reset(teacher.data, teacher._target_dof)
 
         self.follower: Optional[WaypointFollower] = None
         self.goal_xy: Optional[Point] = None
@@ -350,17 +387,17 @@ class StepwiseNav:
         is_turn = False
 
         if self.follower is None or hold:
-            self.teacher.step(vel_cmd=(0.0, 0.0, 0.0))
+            self._execute((0.0, 0.0, 0.0), 0.0, 0.0)
         else:
             target = self.follower.target(pxy)
             if self.follower.done or target is None:
-                self.teacher.step(vel_cmd=(0.0, 0.0, 0.0))
+                self._execute((0.0, 0.0, 0.0), 0.0, 0.0)
             else:
                 vel_cmd, dist, yaw_err, is_turn = shape_command(
                     pxy, pyaw, target, self.params, turn_run=self.turn_run)
                 self.turn_run = self.turn_run + 1 if is_turn else 0
                 self.max_turn_run = max(self.max_turn_run, self.turn_run)
-                self.teacher.step(vel_cmd=tuple(float(v) for v in vel_cmd))
+                self._execute(vel_cmd, dist, yaw_err)
 
         if not is_turn:
             self.turn_run = 0
@@ -369,6 +406,29 @@ class StepwiseNav:
         self.fell = self.fell or fell
         return StepInfo(done=self.done, fell=fell, dist=dist, yaw_err=yaw_err,
                         is_turn=is_turn, target_xy=target)
+
+    def _execute(self, vel_cmd, dist: float, yaw_err: float) -> None:
+        """Advance one control step under the active locomotion backend.
+
+        Both backends consume the SAME steer command produced by
+        :func:`shape_command`. The teacher backend hands ``vel_cmd`` to the WBC
+        walk policy; the VLA backend injects the egocentric goal
+        (``goal_vec(dist, yaw_err)``, exactly as the warehouse DART datagen
+        logged it) and ``vel_cmd`` into the trained policy and drives the same
+        student PD path. A zero command ``(0, 0, 0)`` is the in-distribution
+        standing command in both modes (settle/arrival hold).
+
+        Args:
+            vel_cmd: (3,) steer velocity command ``[vx, vy, ωz]``.
+            dist: Distance to the steering target (m); 0.0 when holding.
+            yaw_err: Signed bearing error to the target (rad); 0.0 when holding.
+        """
+        if self.backend == "teacher":
+            self.teacher.step(vel_cmd=tuple(float(v) for v in vel_cmd))
+        else:
+            gv = steer_goal_vec(dist, yaw_err)
+            self.vla.step(self.model, self.teacher.data, self.teacher._nj,
+                          gv, np.asarray(vel_cmd, dtype=np.float32))
 
     def _accumulate_metrics(self) -> None:
         """Update walked length, min wall clearance and wall-contact flag."""

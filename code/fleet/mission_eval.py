@@ -128,13 +128,15 @@ def _independent_allocation(layout: WarehouseLayout, cfg: dict,
 
 
 def run_mission(klass: str, seed: int, layout: WarehouseLayout, spot: int,
-                teachers: Dict[str, WBCTeacher], max_steps: int) -> dict:
+                teachers: Dict[str, WBCTeacher], max_steps: int,
+                perception_mode: str = "oracle") -> dict:
     """Run one mission of a class and return its metrics dict."""
     objs = build_objects(layout, spot, seed)
     vis = VisibilityConfig()
     t0 = time.time()
     mr = MissionRunner(layout=layout, objects=objs, teachers=teachers,
-                       use_gpu=True, search_deadline_steps=max_steps)
+                       use_gpu=True, search_deadline_steps=max_steps,
+                       perception_mode=perception_mode)
     if klass == "D":
         gt_winner, gt_costs = _independent_allocation(
             layout, mr.scene_cfg, ObjectQuery("red", "cube"), vis)
@@ -159,6 +161,8 @@ def run_mission(klass: str, seed: int, layout: WarehouseLayout, spot: int,
         "any_fell": res.any_fell, "success": bool(success),
         "finder": found[0].sender if found else None,
         "found_step": found[0].t_step if found else None,
+        "perception_mode": perception_mode,
+        "n_confirmations": len(mr.confirmations),
         "time_s": round(elapsed, 1),
     }
     if klass == "D":
@@ -189,7 +193,8 @@ def _plan(seeds: int) -> List[Tuple[str, int, int]]:
     return plan
 
 
-def run_eval(seeds: int, out_dir: str, max_steps: int) -> dict:
+def run_eval(seeds: int, out_dir: str, max_steps: int,
+             perception_mode: str = "oracle") -> dict:
     """Run the full mission suite, write JSON, print the table."""
     os.makedirs(out_dir, exist_ok=True)
     layout = hero_layout()
@@ -199,7 +204,8 @@ def run_eval(seeds: int, out_dir: str, max_steps: int) -> dict:
     results: List[dict] = []
     t0 = time.time()
     for idx, (klass, seed, spot) in enumerate(plan):
-        r = run_mission(klass, seed, layout, spot, teachers, max_steps)
+        r = run_mission(klass, seed, layout, spot, teachers, max_steps,
+                        perception_mode=perception_mode)
         results.append(r)
         with open(os.path.join(out_dir, f"mission_{idx:02d}_{klass}.json"), "w") as f:
             json.dump(r, f, indent=2)
@@ -222,12 +228,14 @@ def _summarize(results: List[dict], elapsed: float) -> dict:
         pc["ok"] += int(r["success"])
     return {
         "n_missions": len(results),
+        "perception_mode": results[0].get("perception_mode", "oracle") if results else "oracle",
         "ac_success": sum(r["success"] for r in ac),
         "ac_total": len(ac),
         "per_class": per_class,
         "d_correct": sum(r.get("alloc_correct", False) for r in d),
         "d_total": len(d),
         "n_falls": sum(r["any_fell"] for r in results),
+        "n_confirmations": sum(r.get("n_confirmations", 0) for r in results),
         "total_time_s": round(elapsed, 1),
     }
 
@@ -245,14 +253,15 @@ def _print_mission(idx: int, r: dict) -> None:
 
 def _print_summary(s: dict, out_dir: str) -> None:
     print("\n" + "=" * 72)
-    print("MISSION EVAL")
+    print(f"MISSION EVAL  (perception_mode={s.get('perception_mode', 'oracle')})")
     print("-" * 72)
     for klass, pc in sorted(s["per_class"].items()):
         print(f"  class {klass}: {pc['ok']}/{pc['n']} success")
     print(f"  A-C combined: {s['ac_success']}/{s['ac_total']} "
           f"(target >= 8/10)")
     print(f"  D allocations correct: {s['d_correct']}/{s['d_total']} (target 3/3)")
-    print(f"  falls: {s['n_falls']}   time: {s['total_time_s']}s")
+    print(f"  falls: {s['n_falls']}   detector confirmations: "
+          f"{s.get('n_confirmations', 0)}   time: {s['total_time_s']}s")
     print(f"  artifacts: {out_dir}/")
     print("=" * 72, flush=True)
 
@@ -263,8 +272,11 @@ def main(argv: Optional[List[str]] = None) -> None:
                     help="seeds per A/B/C class (3*seeds + 3 D missions)")
     ap.add_argument("--out", type=str, default=_DEFAULT_OUT)
     ap.add_argument("--max-steps", type=int, default=9000)
+    ap.add_argument("--perception", choices=("oracle", "groundnet"),
+                    default="oracle", help="visibility backend for can_see")
     args = ap.parse_args(argv)
-    run_eval(args.seeds, args.out, args.max_steps)
+    run_eval(args.seeds, args.out, args.max_steps,
+             perception_mode=args.perception)
 
 
 if __name__ == "__main__":

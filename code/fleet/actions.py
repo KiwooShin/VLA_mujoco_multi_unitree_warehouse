@@ -68,7 +68,9 @@ class FleetRobotActions(RobotActions):
 
     def __init__(self, callsign: str, unit: _UnitLike, scene_cfg: dict,
                  search_ctrl: _SearchLike, carry: _CarryLike, *,
-                 vis_cfg: Optional[VisibilityConfig] = None) -> None:
+                 vis_cfg: Optional[VisibilityConfig] = None,
+                 perception: Optional[object] = None,
+                 confirm_range_m: float = 7.0) -> None:
         """Bind the bridge to one robot's world objects.
 
         Args:
@@ -79,6 +81,14 @@ class FleetRobotActions(RobotActions):
             search_ctrl: This robot's :class:`~code.fleet.search.SearchController`.
             carry: The shared :class:`~code.fleet.carry.CarryManager`.
             vis_cfg: Visibility-oracle geometry (defaults used if None).
+            perception: Optional :class:`~code.fleet.perception_bridge.RobotPerception`.
+                When supplied (``perception_mode="groundnet"``), a matching
+                oracle-visible object within ``confirm_range_m`` is passed to the
+                learned detector to CONFIRM; the DETECTOR's world-xy estimate is
+                returned when it confirms, else the oracle's xy (fallback). When
+                ``None`` (default), ``can_see`` is the pure geometric oracle.
+            confirm_range_m: Max range (m) at which to run the detector confirmer
+                (mirrors ``perception_bridge.CONFIRM_RANGE_M``).
         """
         self.callsign = callsign
         self._unit = unit
@@ -86,11 +96,23 @@ class FleetRobotActions(RobotActions):
         self._search = search_ctrl
         self._carry = carry
         self._vis = vis_cfg or VisibilityConfig()
+        self._perception = perception
+        self._confirm_range_m = float(confirm_range_m)
         self.last_plan_ok: Optional[bool] = None
+        # Provenance of the most recent successful can_see (for evals/video):
+        # "detector" (GROUND_NET confirmed), "oracle_fallback" (oracle-visible but
+        # the detector missed), or "oracle" (oracle mode / out of confirm range).
+        self.last_see_source: Optional[str] = None
 
     # -- perception -------------------------------------------------------
     def can_see(self, query: ObjectQuery) -> Optional[XY]:
-        """Return the world (x, y) of a matching object visible now, else None."""
+        """Return the world (x, y) of a matching object visible now, else None.
+
+        The geometric oracle is always the visibility GATE (physics truth of wall
+        occlusion). In groundnet mode the learned detector then CONFIRMS the
+        oracle-visible object and, on success, refines the reported location to
+        its own world-xy estimate; a detector miss falls back to the oracle xy.
+        """
         walls = self._cfg.get("walls", [])
         objects = self._cfg["objects"]
         xy = self._unit.xy
@@ -103,8 +125,30 @@ class FleetRobotActions(RobotActions):
             oxy = (float(obj["x"]), float(obj["y"]))
             obj_z = max(0.12, float(obj.get("size", 0.2)) / 2.0)
             if is_object_visible(xy, yaw, h, oxy, walls, obj_z=obj_z, cfg=self._vis):
-                return oxy
+                return self._confirm(query, oxy)
         return None
+
+    def _confirm(self, query: ObjectQuery, oracle_xy: XY) -> XY:
+        """Confirm an oracle-visible sighting with the detector (groundnet mode).
+
+        Returns the detector's world-xy estimate when it confirms, else the
+        oracle xy (fallback). In oracle mode (no perception) returns the oracle xy.
+        """
+        if self._perception is None:
+            self.last_see_source = "oracle"
+            return oracle_xy
+        rx, ry = self._unit.xy
+        dist = ((oracle_xy[0] - rx) ** 2 + (oracle_xy[1] - ry) ** 2) ** 0.5
+        if dist > self._confirm_range_m:
+            self.last_see_source = "oracle"
+            return oracle_xy
+        det = self._perception.confirm(
+            query, (rx, ry, self._unit.yaw), oracle_xy=oracle_xy)
+        if det is not None:
+            self.last_see_source = "detector"
+            return det.world_xy
+        self.last_see_source = "oracle_fallback"
+        return oracle_xy
 
     # -- navigation -------------------------------------------------------
     def goto(self, xy: XY) -> None:

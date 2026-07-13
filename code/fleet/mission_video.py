@@ -51,6 +51,11 @@ _SENDER_BGR: Dict[str, Tuple[int, int, int]] = {
     "user": (240, 240, 240), "allocator": (150, 230, 150),
 }
 _PANEL_W: int = 360
+# Detector-inset geometry + how long (sim steps) a confirmation inset lingers
+# after its last frame (~2 s of video time at 50 Hz control).
+_INSET_W: int = 264
+_INSET_H: int = 198
+_INSET_HOLD_STEPS: int = 100
 # Max polyline points drawn per robot trail per frame. Trails grow by one point
 # per control step, so drawing every point made overlay time grow linearly per
 # frame (quadratic per mission — profiled at ~87% of render wall time); striding
@@ -191,15 +196,69 @@ def draw_overlay(frame: np.ndarray, cam: bevmod.BevCamera, mr: MissionRunner,
     bevmod.put_hud(frame, hud)
 
 
+def _recent_confirmation(mr: MissionRunner, t: int):
+    """The most recent detector confirmation still within the linger window, or None."""
+    best = None
+    for step, det in mr.confirmations:
+        if step <= t and (t - step) <= _INSET_HOLD_STEPS:
+            best = (step, det)
+    return best
+
+
+def draw_detector_inset(frame: np.ndarray, det, step: int, t: int) -> None:
+    """Overlay the grounding-cam frame + heatmap peak marker + caption (in-place).
+
+    Shows what the learned detector actually saw when it confirmed: the 480x360
+    grounding frame (downscaled), a translucent heatmap wash + a ring on the
+    detector's peak pixel, a title bar and the ASCII caption line, plus a
+    transcript-style GROUND_NET event line beneath it.
+    """
+    import cv2
+
+    inset = cv2.resize(cv2.cvtColor(det.cam_rgb, cv2.COLOR_RGB2BGR),
+                       (_INSET_W, _INSET_H), interpolation=cv2.INTER_AREA)
+    if det.heatmap is not None:
+        heat = np.clip(det.heatmap, 0.0, 1.0)
+        heat_u8 = cv2.resize((heat * 255).astype(np.uint8), (_INSET_W, _INSET_H),
+                             interpolation=cv2.INTER_LINEAR)
+        cmap = cv2.applyColorMap(heat_u8, cv2.COLORMAP_JET)
+        inset = cv2.addWeighted(inset, 0.7, cmap, 0.3, 0.0)
+        py, px = np.unravel_index(int(np.argmax(heat)), heat.shape)
+        mx = int(px / heat.shape[1] * _INSET_W)
+        my = int(py / heat.shape[0] * _INSET_H)
+        cv2.circle(inset, (mx, my), 9, (60, 255, 255), 2, cv2.LINE_AA)
+        cv2.drawMarker(inset, (mx, my), (60, 255, 255), cv2.MARKER_CROSS, 14, 1)
+
+    x0, y0 = 12, 12
+    h, w = inset.shape[:2]
+    cv2.rectangle(frame, (x0 - 3, y0 - 3), (x0 + w + 3, y0 + h + 3), (60, 255, 120), 2)
+    frame[y0:y0 + h, x0:x0 + w] = inset
+    title = f"GROUND_NET grounding cam ({det.callsign})"
+    cv2.rectangle(frame, (x0 - 3, y0 - 22), (x0 + w + 3, y0 - 3), (30, 30, 30), -1)
+    cv2.putText(frame, _ascii(title), (x0 + 2, y0 - 8), cv2.FONT_HERSHEY_SIMPLEX,
+                0.42, (120, 255, 160), 1, cv2.LINE_AA)
+    cap = _ascii(det.caption())
+    cy = y0 + h + 18
+    for th, col in ((3, (0, 0, 0)), (1, (140, 255, 170))):
+        cv2.putText(frame, cap, (x0, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.46, col, th,
+                    cv2.LINE_AA)
+    evline = _ascii(f"[detector] {det.callsign} confirms {det.query_desc} @ "
+                    f"({det.world_xy[0]:.1f},{det.world_xy[1]:.1f})  t={step}")
+    cv2.putText(frame, evline, (x0, cy + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.40,
+                (150, 230, 150), 1, cv2.LINE_AA)
+
+
 def record_mission_video(scenario: str, out_dir: str, *, decimation: int,
-                         fps: int, max_steps: int, seed: int) -> Optional[str]:
+                         fps: int, max_steps: int, seed: int,
+                         perception_mode: str = "oracle") -> Optional[str]:
     """Run a scenario mission and write the composited MP4. Returns its path."""
     import cv2
 
     os.makedirs(out_dir, exist_ok=True)
     spot = _SCENARIO_SPOT.get(scenario, 5)
     mr = MissionRunner(layout=hero_layout(), objects=_build_objects(spot),
-                       seed=seed, use_gpu=True, search_deadline_steps=max_steps)
+                       seed=seed, use_gpu=True, search_deadline_steps=max_steps,
+                       perception_mode=perception_mode)
     viz = mr.fleet.viz
     assert viz is not None
     cam = bevmod.fit_bev_camera(mr.layout.hall_x, mr.layout.hall_y,
@@ -217,6 +276,10 @@ def record_mission_video(scenario: str, out_dir: str, *, decimation: int,
         frame = np.ascontiguousarray(
             cv2.cvtColor(viz.render_bev(cam), cv2.COLOR_RGB2BGR))
         draw_overlay(frame, cam, runner, t)
+        if perception_mode == "groundnet":
+            recent = _recent_confirmation(runner, t)
+            if recent is not None:
+                draw_detector_inset(frame, recent[1], recent[0], t)
         panel = render_transcript_panel(runner, frame.shape[0])
         return np.hstack([frame, panel])
 
@@ -252,9 +315,13 @@ def main(argv: Optional[List[str]] = None) -> None:
     ap.add_argument("--fps", type=int, default=30)
     ap.add_argument("--max-steps", type=int, default=9000)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--perception", choices=("oracle", "groundnet"),
+                    default="oracle",
+                    help="groundnet overlays live GROUND_NET detector insets")
     args = ap.parse_args(argv)
     record_mission_video(args.scenario, args.out, decimation=args.decimation,
-                         fps=args.fps, max_steps=args.max_steps, seed=args.seed)
+                         fps=args.fps, max_steps=args.max_steps, seed=args.seed,
+                         perception_mode=args.perception)
 
 
 if __name__ == "__main__":

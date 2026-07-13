@@ -19,6 +19,7 @@ The full transcript and per-robot trails are retained for the video.
 from __future__ import annotations
 
 import dataclasses
+import math
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import mujoco
@@ -32,7 +33,7 @@ from code.fleet.allocator import AllocationResult, RobotPose, allocate
 from code.fleet.carry import CarryManager
 from code.fleet.fleet import Fleet
 from code.fleet.search import SEARCH_REGIONS, SearchController
-from code.fleet.visibility import VisibilityConfig
+from code.fleet.visibility import VisibilityConfig, is_object_visible
 from code.sim.arena_build import COLORS, SHAPES
 from code.warehouse.layout import CALLSIGNS, WarehouseLayout, hero_layout
 
@@ -102,7 +103,8 @@ class MissionRunner:
                  reply_deadline_steps: int = 60,
                  search_deadline_steps: int = 6000,
                  vis_cfg: Optional[VisibilityConfig] = None,
-                 regions: Sequence[str] = SEARCH_REGIONS) -> None:
+                 regions: Sequence[str] = SEARCH_REGIONS,
+                 perception_mode: str = "oracle") -> None:
         """Build the fleet, bus, per-robot protocols/bridges and carry manager.
 
         Args:
@@ -116,11 +118,17 @@ class MissionRunner:
             search_deadline_steps: Delegated-search timeout (steps).
             vis_cfg: Visibility-oracle geometry.
             regions: Region labels for search delegation + allocation.
+            perception_mode: ``"oracle"`` (default; the pure geometric visibility
+                oracle drives ``can_see`` — deterministic, for determinism-sensitive
+                evals) or ``"groundnet"`` (the real learned detector CONFIRMS each
+                oracle-visible sighting and refines the reported location). The
+                protocol and message flow are identical in both modes.
         """
         self.layout = layout or hero_layout()
         self.callsigns: List[str] = list(callsigns)
         self._vis = vis_cfg or VisibilityConfig()
         self._regions = tuple(regions)
+        self.perception_mode = perception_mode
 
         self.fleet = Fleet(self.layout, goals={}, callsigns=self.callsigns,
                            use_gpu=use_gpu, teachers=teachers, build_viz=True,
@@ -140,6 +148,15 @@ class MissionRunner:
 
         self.bus = MessageBus(self._now)
         self.carry = CarryManager(self.fleet, self.scene_cfg)
+        # GROUND_NET perception (groundnet mode only): shared detector weights +
+        # one grounding renderer for the whole fleet, one isolated RobotPerception
+        # per robot. Empty in oracle mode (import graph + behaviour unchanged).
+        self.perceptions: Dict[str, object] = {}
+        self._grounding_renderer = None
+        # Accepted detector confirmations, ``(step, DetectionResult)`` (video/eval).
+        self.confirmations: List[Tuple[int, object]] = []
+        if perception_mode == "groundnet":
+            self._build_perceptions()
         self._search: Dict[str, SearchController] = {}
         self.actions: Dict[str, FleetRobotActions] = {}
         self.protocols: Dict[str, RobotProtocol] = {}
@@ -147,7 +164,8 @@ class MissionRunner:
             peers = [c for c in self.callsigns if c != cs]
             search_ctrl = SearchController(self.fleet.units[cs])
             act = FleetRobotActions(cs, self.fleet.units[cs], self.scene_cfg,
-                                    search_ctrl, self.carry, vis_cfg=self._vis)
+                                    search_ctrl, self.carry, vis_cfg=self._vis,
+                                    perception=self.perceptions.get(cs))
             self._search[cs] = search_ctrl
             self.actions[cs] = act
             self.protocols[cs] = RobotProtocol(
@@ -166,6 +184,78 @@ class MissionRunner:
         # drain, queued-once notice sent, failed if still unassigned at budget end.
         self._pending_fleet: List[TaskSpec] = []
         self._fleet_queued_notified = False
+
+    # -- perception (groundnet mode) --------------------------------------
+    def _build_perceptions(self) -> None:
+        """Build the shared GROUND_NET detector + renderer and per-robot confirmers.
+
+        The detector weights are loaded ONCE and the single model object is
+        shared across all four per-robot :class:`RobotPerception` states (only
+        their track-hysteresis + heatmap caches are per-robot). Falls back to the
+        classical HSV pipeline per robot if the checkpoint is missing.
+        """
+        from code.fleet.perception_bridge import (GroundingCamRenderer,
+                                                   RobotPerception,
+                                                   load_shared_detector)
+        if self.fleet.viz is None:
+            raise ValueError("groundnet perception requires a fleet built with build_viz=True")
+        detector = load_shared_detector()
+        self._grounding_renderer = GroundingCamRenderer(self.fleet.viz.model)
+        for cs in self.callsigns:
+            self.perceptions[cs] = RobotPerception(
+                cs, self.fleet.viz, detector=detector,
+                renderer=self._grounding_renderer)
+
+    def _perception_step(self, t: int) -> None:
+        """Groundnet-mode per-step perception: owner-approach confirmation + drain.
+
+        No-op in oracle mode. The ``can_see`` confirmations (single-shot at
+        find-time) already ran inside the protocol step; here the navigating
+        owner additionally runs the learned detector on the target it is walking
+        toward — the natural "keep perceiving the target during approach" signal,
+        which is where the grounding cam gets well-framed looks (the visibility
+        edge, by contrast, is often at a wide bearing outside its narrower FOV).
+        This is telemetry only: it never changes the oracle-gated found location
+        or the protocol/message flow.
+        """
+        if self.perception_mode != "groundnet":
+            return
+        self._owner_approach_confirm()
+        for cs in self.callsigns:
+            p = self.perceptions.get(cs)
+            if p is None:
+                continue
+            ev = p.pop_confirmation()
+            if ev is not None:
+                self.confirmations.append((t, ev))
+
+    def _owner_approach_confirm(self) -> None:
+        """Run the detector on the owner's target while it navigates toward it."""
+        from code.fleet.perception_bridge import (CONFIRM_RANGE_M,
+                                                   GROUNDING_HALF_FOV_DEG)
+        owner = self.primary_owner
+        if (owner is None or owner not in self.perceptions or self.task is None
+                or self.carry.carrying(owner)
+                or self.protocols[owner].state is not RobotState.OWNER_NAVIGATING):
+            return
+        tgt = self.target_xy()
+        if tgt is None:
+            return
+        u = self.fleet.units[owner]
+        rx, ry = u.xy
+        yaw = u.yaw
+        walls = self.scene_cfg.get("walls", [])
+        if not is_object_visible((rx, ry), yaw, u.base_height, tgt, walls,
+                                 cfg=self._vis):
+            return  # occluded / out of oracle FOV -> nothing to confirm
+        dx, dy = tgt[0] - rx, tgt[1] - ry
+        dist = math.hypot(dx, dy)
+        bearing = math.degrees((math.atan2(dy, dx) - yaw + math.pi)
+                               % (2.0 * math.pi) - math.pi)
+        if dist > CONFIRM_RANGE_M or abs(bearing) > GROUNDING_HALF_FOV_DEG:
+            return  # outside the grounding cam's usable range / narrower FOV
+        self.perceptions[owner].confirm(self.task.query, (rx, ry, yaw),
+                                        oracle_xy=tgt)
 
     # -- clock ------------------------------------------------------------
     def _now(self) -> int:
@@ -268,6 +358,10 @@ class MissionRunner:
         Returns:
             A :class:`MissionResult`.
         """
+        # Per-mission reset of every robot's detector track state (no cross-
+        # mission leak — the singleton bug the baseline survey flagged).
+        for p in self.perceptions.values():
+            p.reset()
         for t in range(max_steps):
             self._t = t
             self._run_allocator()
@@ -277,6 +371,7 @@ class MissionRunner:
                 self._search[cs].tick()
             for cs in self.callsigns:
                 self.protocols[cs].step(t)
+            self._perception_step(t)
             for cs in self.callsigns:
                 self.trails[cs].append(self.fleet.units[cs].xy)
             self._steps = t + 1
@@ -366,5 +461,8 @@ class MissionRunner:
         return self.bus.transcript_lines()
 
     def close(self) -> None:
-        """Release the fleet's viz renderers."""
+        """Release the fleet's viz renderers (and the grounding renderer)."""
+        if self._grounding_renderer is not None:
+            self._grounding_renderer.close()
+            self._grounding_renderer = None
         self.fleet.close()

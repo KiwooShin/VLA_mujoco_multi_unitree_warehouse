@@ -76,11 +76,51 @@ CONFIRM_RANGE_M: float = 7.0
 # only runs the detector within THIS narrower, honest field of view.
 GROUNDING_HALF_FOV_DEG: float = 28.0
 
-_CKPT_DEFAULT = os.environ.get(
-    "GROUND_NET_CKPT",
-    str((os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
-        + "/runs/nx6_heatmap_B/model_best.pt"))
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+# The warehouse-domain fine-tune (Cycle-2b, this task) and the original
+# playground-trained baseline. The fine-tune becomes the default the moment its
+# weights exist on disk; until then the loader falls back to the baseline so a
+# fresh clone (no fine-tune yet) still runs.
+_WAREHOUSE_FT_CKPT = os.path.join(_REPO_ROOT, "runs", "nx6_warehouse_ft", "model_best.pt")
+_ORIGINAL_CKPT = os.path.join(_REPO_ROOT, "runs", "nx6_heatmap_B", "model_best.pt")
 _DEVICE_DEFAULT = os.environ.get("GROUND_NET_DEVICE", "cuda")
+
+
+def resolve_ckpt_path(*, ft_ckpt: str = _WAREHOUSE_FT_CKPT,
+                      orig_ckpt: str = _ORIGINAL_CKPT,
+                      env_var: str = "GROUND_NET_CKPT") -> str:
+    """Resolve which GROUND_NET checkpoint the fleet should load.
+
+    Resolution order (highest priority first), documented so operators know how
+    to override it:
+
+      1. The ``GROUND_NET_CKPT`` environment variable — an explicit operator
+         override (used as-is, whether or not the file exists, so a bad path
+         surfaces loudly rather than silently falling back).
+      2. ``runs/nx6_warehouse_ft/model_best.pt`` — the warehouse-domain
+         fine-tune. Becomes the default automatically WHEN its weights exist.
+      3. ``runs/nx6_heatmap_B/model_best.pt`` — the original playground-trained
+         baseline, the fallback when no fine-tune is present (e.g. a fresh clone).
+
+    Args:
+        ft_ckpt: Fine-tune checkpoint path (overridable for testing).
+        orig_ckpt: Original baseline checkpoint path (overridable for testing).
+        env_var: Environment variable consulted first (overridable for testing).
+
+    Returns:
+        The resolved checkpoint path.
+    """
+    env = os.environ.get(env_var)
+    if env:
+        return env
+    if os.path.exists(ft_ckpt):
+        return ft_ckpt
+    return orig_ckpt
+
+
+# Snapshot at import for logging / back-compat; load_shared_detector re-resolves
+# at call time so a fine-tune produced after import is still picked up.
+_CKPT_DEFAULT = resolve_ckpt_path()
 
 # Process-wide shared detector cache: loaded once, the same model object handed
 # to every per-robot GroundNetState (see load_shared_detector).
@@ -159,7 +199,7 @@ class DetectionResult:
                 f"@ {self.bearing_deg:+.0f}deg (conf {self.confidence:.2f})")
 
 
-def load_shared_detector(ckpt_path: str = _CKPT_DEFAULT,
+def load_shared_detector(ckpt_path: Optional[str] = None,
                          device: str = _DEVICE_DEFAULT):
     """Load the GROUND_NET checkpoint once per process; share the model object.
 
@@ -169,8 +209,9 @@ def load_shared_detector(ckpt_path: str = _CKPT_DEFAULT,
     :class:`~code.perception.ground_net.GroundNetState`'s ``.detector`` field.
 
     Args:
-        ckpt_path: Checkpoint path (defaults to the ``GROUND_NET_CKPT`` env var
-            or ``runs/nx6_heatmap_B/model_best.pt``).
+        ckpt_path: Explicit checkpoint path; when ``None`` (the default) the path
+            is resolved via :func:`resolve_ckpt_path` (env var > warehouse
+            fine-tune > original baseline) at call time.
         device: Torch device string ("cuda" falls back to "cpu" if unavailable).
 
     Returns:
@@ -180,6 +221,8 @@ def load_shared_detector(ckpt_path: str = _CKPT_DEFAULT,
     if _SHARED_LOAD_TRIED:
         return _SHARED_DETECTOR
     _SHARED_LOAD_TRIED = True
+    if ckpt_path is None:
+        ckpt_path = resolve_ckpt_path()
     try:
         import torch
         from code.perception.detector.model import (CLASS_NAMES, COLOR_NAMES,

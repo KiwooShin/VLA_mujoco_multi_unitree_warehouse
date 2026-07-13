@@ -119,13 +119,23 @@ def _frame_record(det, renderer, data, cam_xy: Point, yaw: float, obj_xy: Point,
                 present_raw=bool(conf >= tau))
 
 
-def eval_frames(seeds: int, tau: float, verbose: bool = True) -> dict:
-    """Render + score every sampled frame across ``seeds`` placements."""
+def eval_frames(seeds: int, tau: float, verbose: bool = True,
+                ckpt: Optional[str] = None) -> dict:
+    """Render + score every sampled frame across ``seeds`` placements.
+
+    Args:
+        seeds: Number of red-cube placements (each rings ~40 camera frames).
+        tau: Confidence floor for a detection.
+        verbose: Print the visible/hidden summary tables.
+        ckpt: Explicit GROUND_NET checkpoint to evaluate; when ``None`` the
+            fleet's default resolution order is used (see
+            :func:`code.fleet.perception_bridge.resolve_ckpt_path`).
+    """
     import dataclasses
     layout = hero_layout()
     walls = [dataclasses.asdict(w) for w in layout.walls]
     vis_cfg = VisibilityConfig()
-    det = load_shared_detector()
+    det = load_shared_detector(ckpt)
     if det is None:
         raise RuntimeError("GROUND_NET checkpoint unavailable; cannot run perception eval")
 
@@ -266,15 +276,21 @@ def main(argv: Optional[List[str]] = None) -> None:
     ap.add_argument("--tau", type=float, default=CONFIRM_TAU,
                     help=f"confidence floor for a detection (default {CONFIRM_TAU})")
     ap.add_argument("--out", type=str, default=_DEFAULT_OUT)
+    ap.add_argument("--ckpt", type=str, default=None,
+                    help="GROUND_NET checkpoint to evaluate (default: fleet "
+                         "resolution order — env var > warehouse fine-tune > baseline)")
     ap.add_argument("--mission-seeds", type=int, default=0,
                     help="if >0, also run mission_eval oracle vs groundnet")
     ap.add_argument("--max-steps", type=int, default=9000)
     args = ap.parse_args(argv)
 
     os.makedirs(args.out, exist_ok=True)
+    from code.fleet.perception_bridge import resolve_ckpt_path
+    ckpt = args.ckpt or resolve_ckpt_path()
     print(f"[perception-eval] tau={args.tau} range<={CONFIRM_RANGE_M}m "
-          f"grounding_half_fov={GROUNDING_HALF_FOV_DEG}deg", flush=True)
-    result = eval_frames(args.seeds, args.tau)
+          f"grounding_half_fov={GROUNDING_HALF_FOV_DEG}deg ckpt={ckpt!r}", flush=True)
+    result = eval_frames(args.seeds, args.tau, ckpt=args.ckpt)
+    result["ckpt"] = ckpt
     # Drop the bulky per-frame records from the on-disk JSON summary.
     disk = {k: v for k, v in result.items() if k != "records"}
     if args.mission_seeds > 0:

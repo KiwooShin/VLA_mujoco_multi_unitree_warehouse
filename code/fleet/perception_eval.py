@@ -53,8 +53,8 @@ from code.fleet.perception_bridge import (CONFIRM_RANGE_M, CONFIRM_TAU,
                                            detection_world_xy,
                                            load_shared_detector)
 from code.fleet.viz import _warehouse_base_spec
-from code.fleet.visibility import (VisibilityConfig, is_object_visible,
-                                    line_of_sight_clear)
+from code.fleet.visibility import (_DEFAULT_OBJ_RADIUS, VisibilityConfig,
+                                    is_object_visible, line_of_sight_clear)
 from code.sim.arena_build import COLORS
 from code.warehouse.arena import warehouse_scene_cfg
 from code.warehouse.layout import hero_layout
@@ -69,6 +69,13 @@ _RING_DISTS: Tuple[float, ...] = (2.5, 3.5, 4.5, 5.5)
 _RING_ANGLES_DEG: Tuple[float, ...] = tuple(range(0, 360, 30))  # 12 angles
 _BASE_H: float = 0.744               # pelvis/camera-mount height (m)
 _XY_HIT_M: float = 1.0               # decoded xy within this of truth == a real hit
+# Minimum camera-to-wall clearance for a *physically valid* ring pose (m). The
+# naive ring places some cameras inside/against a shelf — poses no robot could
+# occupy (nav inflation is 0.40 m). MuJoCo then near-clips the shelf, so its
+# render shows an object the 2-D oracle (correctly) calls occluded, manufacturing
+# a "through-wall FP". Scoring only reachable poses (camera >= this from every
+# tall wall, ~a robot body radius) keeps the wall-occluded FP metric honest.
+_MIN_CAM_WALL_CLEARANCE_M: float = 0.35
 _FILLER = (("orange", "cube", 0.24), ("blue", "cylinder", 0.22),
            ("green", "ball", 0.24), ("yellow", "cone", 0.26),
            ("purple", "cube", 0.24), ("cyan", "cylinder", 0.22),
@@ -98,13 +105,47 @@ def _pct(xs: List[float], p: float) -> float:
     return ys[min(len(ys) - 1, max(0, int(round(p * (len(ys) - 1)))))]
 
 
+def _cam_wall_clearance(cam_xy: Point, walls) -> float:
+    """Min distance from ``cam_xy`` to any tall (occluding) wall footprint (m)."""
+    best = float("inf")
+    for w in walls:
+        if float(w.get("height", 2.5)) <= 0.25:
+            continue  # short props never occlude / never block a robot's stance
+        cx, cy, yaw = float(w["cx"]), float(w["cy"]), float(w.get("yaw", 0.0))
+        c, s = math.cos(yaw), math.sin(yaw)
+        lx = (cam_xy[0] - cx) * c + (cam_xy[1] - cy) * s
+        ly = -(cam_xy[0] - cx) * s + (cam_xy[1] - cy) * c
+        dx = max(abs(lx) - float(w["half_x"]), 0.0)
+        dy = max(abs(ly) - float(w["half_y"]), 0.0)
+        best = min(best, math.hypot(dx, dy))
+    return best
+
+
+def _camera_pose_valid(cam_xy: Point, walls, clearance: float) -> bool:
+    """Whether a ring camera pose is one a robot could actually occupy.
+
+    Rejects poses inside/against a tall wall (< ``clearance`` from its footprint):
+    those are physically unreachable and only produce near-clip see-through
+    artifacts, not real sightings.
+    """
+    return _cam_wall_clearance(cam_xy, walls) >= clearance
+
+
 def _frame_record(det, renderer, data, cam_xy: Point, yaw: float, obj_xy: Point,
-                  obj_z: float, walls, vis_cfg, tau: float) -> dict:
-    """Render one camera pose and score the detector against the oracle."""
+                  obj_z: float, walls, vis_cfg, tau: float,
+                  obj_radius: float) -> dict:
+    """Render one camera pose and score the detector against the oracle.
+
+    ``obj_radius`` is the object planar half-extent sampled by the LOS oracle
+    (0 -> the historical centre-only segment; ~0.12 m -> the partial-visibility
+    sampling). It is the single knob that produces the relabeling before/after
+    table: a partially visible object flips from oracle-HIDDEN to oracle-VISIBLE.
+    """
     oracle_vis = is_object_visible(cam_xy, yaw, _BASE_H, obj_xy, walls,
-                                   obj_z=obj_z, cfg=vis_cfg)
+                                   obj_z=obj_z, obj_radius=obj_radius, cfg=vis_cfg)
     los = line_of_sight_clear(cam_xy, obj_xy, walls,
-                              head_z=vis_cfg.head_z(_BASE_H), obj_z=obj_z)
+                              head_z=vis_cfg.head_z(_BASE_H), obj_z=obj_z,
+                              obj_radius=obj_radius)
     pelvis = (cam_xy[0], cam_xy[1], _BASE_H)
     rgb, depth, _ = renderer.render(data, pelvis, yaw)
     out = det.infer(rgb, depth, class_name="cube", color_name="red",
@@ -120,7 +161,9 @@ def _frame_record(det, renderer, data, cam_xy: Point, yaw: float, obj_xy: Point,
 
 
 def eval_frames(seeds: int, tau: float, verbose: bool = True,
-                ckpt: Optional[str] = None) -> dict:
+                ckpt: Optional[str] = None,
+                obj_radius: float = _DEFAULT_OBJ_RADIUS,
+                min_cam_clearance: float = _MIN_CAM_WALL_CLEARANCE_M) -> dict:
     """Render + score every sampled frame across ``seeds`` placements.
 
     Args:
@@ -130,6 +173,12 @@ def eval_frames(seeds: int, tau: float, verbose: bool = True,
         ckpt: Explicit GROUND_NET checkpoint to evaluate; when ``None`` the
             fleet's default resolution order is used (see
             :func:`code.fleet.perception_bridge.resolve_ckpt_path`).
+        obj_radius: Object planar half-extent the oracle samples for LOS (m).
+            ``0.0`` reproduces the historical centre-only labelling (the "before"
+            of the partial-visibility relabeling); the default matches the fleet.
+        min_cam_clearance: Reject ring camera poses closer than this to any tall
+            wall (m). ``0.0`` reproduces the historical (unfiltered) ring that
+            scored physically-invalid, near-clip camera poses.
     """
     import dataclasses
     layout = hero_layout()
@@ -159,9 +208,11 @@ def eval_frames(seeds: int, tau: float, verbose: bool = True,
                 if not (layout.hall_x / -2 + 0.4 < cam_xy[0] < layout.hall_x / 2 - 0.4
                         and layout.hall_y / -2 + 0.4 < cam_xy[1] < layout.hall_y / 2 - 0.4):
                     continue  # camera outside the hall
+                if not _camera_pose_valid(cam_xy, walls, min_cam_clearance):
+                    continue  # camera inside/against a shelf: unreachable pose
                 yaw = math.atan2(obj_xy[1] - cam_xy[1], obj_xy[0] - cam_xy[0])
                 rec = _frame_record(det, renderer, data, cam_xy, yaw, obj_xy,
-                                    obj_z, walls, vis_cfg, tau)
+                                    obj_z, walls, vis_cfg, tau, obj_radius)
                 rec.update(seed=s, spot=spot, dist=float(d), angle=int(ang))
                 records.append(rec)
         renderer.close()
@@ -282,15 +333,27 @@ def main(argv: Optional[List[str]] = None) -> None:
     ap.add_argument("--mission-seeds", type=int, default=0,
                     help="if >0, also run mission_eval oracle vs groundnet")
     ap.add_argument("--max-steps", type=int, default=9000)
+    ap.add_argument("--obj-radius", type=float, default=_DEFAULT_OBJ_RADIUS,
+                    help="object planar half-extent the oracle samples for LOS "
+                         "(0 = historical centre-only labelling)")
+    ap.add_argument("--min-cam-clearance", type=float,
+                    default=_MIN_CAM_WALL_CLEARANCE_M,
+                    help="reject ring camera poses closer than this to a tall wall "
+                         "(0 = historical unfiltered ring)")
     args = ap.parse_args(argv)
 
     os.makedirs(args.out, exist_ok=True)
     from code.fleet.perception_bridge import resolve_ckpt_path
     ckpt = args.ckpt or resolve_ckpt_path()
     print(f"[perception-eval] tau={args.tau} range<={CONFIRM_RANGE_M}m "
-          f"grounding_half_fov={GROUNDING_HALF_FOV_DEG}deg ckpt={ckpt!r}", flush=True)
-    result = eval_frames(args.seeds, args.tau, ckpt=args.ckpt)
+          f"grounding_half_fov={GROUNDING_HALF_FOV_DEG}deg obj_radius={args.obj_radius}m "
+          f"min_cam_clearance={args.min_cam_clearance}m ckpt={ckpt!r}", flush=True)
+    result = eval_frames(args.seeds, args.tau, ckpt=args.ckpt,
+                         obj_radius=args.obj_radius,
+                         min_cam_clearance=args.min_cam_clearance)
     result["ckpt"] = ckpt
+    result["obj_radius"] = args.obj_radius
+    result["min_cam_clearance"] = args.min_cam_clearance
     # Drop the bulky per-frame records from the on-disk JSON summary.
     disk = {k: v for k, v in result.items() if k != "records"}
     if args.mission_seeds > 0:

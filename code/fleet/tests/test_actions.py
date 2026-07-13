@@ -7,6 +7,7 @@ bridge's wiring is exercised without stepping any physics.
 from __future__ import annotations
 
 import math
+import types
 import unittest
 
 import numpy as np
@@ -18,6 +19,18 @@ from code.warehouse.arena import warehouse_scene_cfg
 from code.warehouse.layout import hero_layout
 
 _CMAP = dict(COLORS)
+
+
+class _FakePerception:
+    """A scripted GROUND_NET confirmer: confirms with a fixed world-xy estimate."""
+
+    def __init__(self, world_xy) -> None:
+        self._xy = world_xy
+        self.confirms = []
+
+    def confirm(self, query, robot_pose, *, oracle_xy=None):
+        self.confirms.append((robot_pose, oracle_xy))
+        return types.SimpleNamespace(world_xy=self._xy)
 
 
 class _FakeUnit:
@@ -119,6 +132,40 @@ class TestCanSee(unittest.TestCase):
         carry._carried.add(0)  # the red cube is being carried
         act = FleetRobotActions("Alpha", unit, cfg, _FakeSearch(), carry)
         self.assertIsNone(act.can_see(ObjectQuery("red", "cube")))
+
+
+class TestReconfirmTarget(unittest.TestCase):
+    """D-14: the pickup re-approach forces a fresh close-range detector fix."""
+
+    def test_oracle_mode_returns_none(self) -> None:
+        # No perception (oracle mode) -> no fresh fix, retry keeps its goal.
+        cfg = _scene()
+        unit = _FakeUnit((-5.0, -5.0), math.pi / 2)
+        act = FleetRobotActions("Alpha", unit, cfg, _FakeSearch(), _FakeCarry())
+        self.assertIsNone(act.reconfirm_target(ObjectQuery("red", "cube")))
+
+    def test_groundnet_mode_returns_detector_estimate(self) -> None:
+        # With a confirmer, reconfirm re-runs the detector and returns its estimate.
+        cfg = _scene()
+        unit = _FakeUnit((-5.0, -5.0), math.pi / 2)  # sees the red cube up the lane
+        percep = _FakePerception((-4.9, 0.55))       # detector's fresh xy
+        act = FleetRobotActions("Alpha", unit, cfg, _FakeSearch(), _FakeCarry(),
+                                perception=percep)
+        got = act.reconfirm_target(ObjectQuery("red", "cube"))
+        self.assertEqual(got, (-4.9, 0.55))
+        self.assertEqual(len(percep.confirms), 1)
+        self.assertEqual(act.last_see_source, "detector")
+
+    def test_groundnet_none_when_target_not_visible(self) -> None:
+        # Object out of view -> no fresh fix (the oracle gate still applies).
+        cfg = _scene()
+        unit = _FakeUnit((-5.0, -5.0), math.pi / 2)
+        percep = _FakePerception((6.5, 4.7))
+        act = FleetRobotActions("Alpha", unit, cfg, _FakeSearch(), _FakeCarry(),
+                                perception=percep)
+        # The red BALL sits in the far alcove -> not oracle-visible from the bay.
+        self.assertIsNone(act.reconfirm_target(ObjectQuery("red", "ball")))
+        self.assertEqual(percep.confirms, [])
 
 
 class TestNavAndSearch(unittest.TestCase):

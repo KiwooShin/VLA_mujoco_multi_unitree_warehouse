@@ -288,9 +288,17 @@ class MissionRunner:
                 self.confirmations.append((t, ev))
 
     def _owner_approach_confirm(self) -> None:
-        """Run the detector on the owner's target while it navigates toward it."""
+        """Run the detector on the owner's target while it navigates toward it.
+
+        The accepted confirmation (a well-framed, close-range look) additionally
+        STEERS the owner's fetch goal onto the detector's fresh estimate via
+        :meth:`~code.comms.protocol.RobotProtocol.refine_nav_goal` — the D-14
+        fix: a stale/off found-location can no longer strand the owner outside
+        pickup range, because the approach itself continuously refines the goal.
+        """
         from code.fleet.perception_bridge import (CONFIRM_RANGE_M,
-                                                   GROUNDING_HALF_FOV_DEG)
+                                                   GROUNDING_HALF_FOV_DEG,
+                                                   REFINE_MIN_CONF)
         owner = self.primary_owner
         if (owner is None or owner not in self.perceptions or self.task is None
                 or self.carry.carrying(owner)
@@ -312,8 +320,12 @@ class MissionRunner:
                                % (2.0 * math.pi) - math.pi)
         if dist > CONFIRM_RANGE_M or abs(bearing) > GROUNDING_HALF_FOV_DEG:
             return  # outside the grounding cam's usable range / narrower FOV
-        self.perceptions[owner].confirm(self.task.query, (rx, ry, yaw),
-                                        oracle_xy=tgt)
+        det = self.perceptions[owner].confirm(self.task.query, (rx, ry, yaw),
+                                              oracle_xy=tgt)
+        # D-14: a confident, well-framed close-range confirmation refines the goal.
+        if det is not None and det.confidence >= REFINE_MIN_CONF:
+            self.protocols[owner].refine_nav_goal(det.world_xy, self._t,
+                                                  robot_xy=(rx, ry))
 
     # -- clock ------------------------------------------------------------
     def _now(self) -> int:

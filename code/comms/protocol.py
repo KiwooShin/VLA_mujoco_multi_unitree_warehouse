@@ -29,6 +29,7 @@ from __future__ import annotations
 import abc
 import dataclasses
 import enum
+import math
 from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from code.comms.bus import MessageBus
@@ -46,6 +47,22 @@ RegionAssigner = Callable[[Sequence[str], Sequence[str]], List[Tuple[str, str]]]
 # How many times a missed mock pickup is re-attempted (re-approach) before the
 # owner declares the fetch failed. One retry is enough for a transient miss.
 MAX_PICKUP_RETRIES: int = 1
+
+# Close-range goal refinement (D-14 delivery outlier). While the owner walks to a
+# found location, the fleet's continuous approach-confirmation stream feeds fresh,
+# well-framed detector estimates to :meth:`RobotProtocol.refine_nav_goal`, which
+# steers the fetch goal onto the better estimate so a stale/off report can't
+# strand the owner outside pickup range. Bounded so it can never thrash: at most
+# one refinement every ``GOAL_REFINE_INTERVAL`` steps, only a plausible
+# *same-object* nudge (moves more than ``GOAL_REFINE_MIN_DELTA_M`` but no farther
+# than ``GOAL_REFINE_MAX_DELTA_M`` from the current goal), and only while the
+# owner is still farther than ``GOAL_REFINE_MIN_RANGE_M`` (the pickup radius) from
+# the goal. In oracle mode the fleet never calls this (the report is exact), so
+# oracle behaviour is byte-identical.
+GOAL_REFINE_INTERVAL: int = 50          # K: min steps between refinements
+GOAL_REFINE_MAX_DELTA_M: float = 2.5    # same-object sanity (reject far jumps)
+GOAL_REFINE_MIN_DELTA_M: float = 0.3    # ignore sub-threshold nudges
+GOAL_REFINE_MIN_RANGE_M: float = 0.6    # only refine while > pickup radius away
 
 # Default region labels handed to searchers, partitioning the hall. These MUST
 # be regions that :func:`code.fleet.search.region_bounds` understands, otherwise
@@ -89,6 +106,17 @@ class RobotActions(abc.ABC):
     @abc.abstractmethod
     def can_see(self, query: ObjectQuery) -> Optional[XY]:
         """Return the object's world ``(x, y)`` if currently visible, else ``None``."""
+
+    def reconfirm_target(self, query: ObjectQuery) -> Optional[XY]:
+        """Force a fresh close-range perception fix on the target, or ``None``.
+
+        Called before a pickup re-approach so the retry heads for the object's
+        current best estimate rather than a stale reported point (D-14). The base
+        implementation returns ``None`` (no fresh fix — the caller keeps its
+        current goal), which is exactly the behaviour with a perfect oracle; the
+        fleet bridge overrides it to re-run the learned detector in groundnet
+        mode only, leaving the oracle path byte-identical."""
+        return None
 
     def report_origin(self) -> Tuple[XY, str]:
         """Return the reporter's own ``(x, y)`` pose and its region/room name.
@@ -213,6 +241,7 @@ class RobotProtocol:
         self._nav_issued_t = 0
         self._nav_target: Optional[XY] = None  # object location for pickup re-approach
         self._pickup_retries = 0
+        self._last_refine_t = 0  # last close-range goal refinement (D-14)
 
         # Helper-role bookkeeping.
         self._assist: Optional[_AssistCtx] = None
@@ -241,6 +270,43 @@ class RobotProtocol:
                             RobotState.OWNER_DELIVERING):
             return self._nav_target
         return None
+
+    def refine_nav_goal(self, new_xy: XY, t: int, *, robot_xy: XY) -> bool:
+        """Steer the in-flight fetch goal onto a fresher close-range estimate (D-14).
+
+        Only acts while this owner is walking to a found object (``OWNER_NAVIGATING``
+        — never mid-delivery), and only for a bounded, plausible *same-object*
+        refinement (see the ``GOAL_REFINE_*`` constants): rate-limited to once per
+        ``GOAL_REFINE_INTERVAL`` steps, the new estimate must move the goal by more
+        than ``GOAL_REFINE_MIN_DELTA_M`` but no farther than ``GOAL_REFINE_MAX_DELTA_M``,
+        and the owner must still be farther than the pickup radius
+        (``GOAL_REFINE_MIN_RANGE_M``) from the current goal. When accepted it updates
+        the goal and re-plans (a fresh :meth:`RobotActions.goto`).
+
+        Args:
+            new_xy: The detector's fresh world ``(x, y)`` estimate of the object.
+            t: The current simulation step (for the rate limit).
+            robot_xy: The owner's current pelvis ``(x, y)`` (for the range gate).
+
+        Returns:
+            True iff the goal was refined and a fresh navigation issued.
+        """
+        if self._state is not RobotState.OWNER_NAVIGATING or self._nav_target is None:
+            return False
+        if t - self._last_refine_t < GOAL_REFINE_INTERVAL:
+            return False
+        gx, gy = self._nav_target
+        nx, ny = float(new_xy[0]), float(new_xy[1])
+        delta = math.hypot(nx - gx, ny - gy)
+        if not (GOAL_REFINE_MIN_DELTA_M < delta <= GOAL_REFINE_MAX_DELTA_M):
+            return False
+        if math.hypot(gx - float(robot_xy[0]), gy - float(robot_xy[1])) <= GOAL_REFINE_MIN_RANGE_M:
+            return False  # already within pickup range of the goal — don't nudge
+        self._nav_target = (nx, ny)
+        self._last_refine_t = t
+        self._nav_issued_t = t
+        self._actions.goto(self._nav_target)
+        return True
 
     def step(self, t_step: int) -> None:
         """Advance the state machine by one simulation step.
@@ -404,6 +470,7 @@ class RobotProtocol:
         self._nav_issued_t = t
         self._nav_target = (float(location[0]), float(location[1]))
         self._pickup_retries = 0
+        self._last_refine_t = t
         self._actions.goto(location)
         self._notify_user(
             Performative.STATUS_UPDATE,
@@ -421,7 +488,16 @@ class RobotProtocol:
         elif self._pickup_retries < MAX_PICKUP_RETRIES:
             # Grasp missed: re-approach the object once before giving up. Never
             # transition to delivery (let alone completion) without a real hold.
+            # D-14: force a fresh close-range perception fix first, so the retry
+            # heads for the object's current best estimate rather than the stale
+            # reported point (returns None -> unchanged goal in oracle mode).
             self._pickup_retries += 1
+            fresh = self._actions.reconfirm_target(self._task.query)
+            if fresh is not None and self._nav_target is not None:
+                fx, fy = float(fresh[0]), float(fresh[1])
+                if math.hypot(fx - self._nav_target[0],
+                              fy - self._nav_target[1]) <= GOAL_REFINE_MAX_DELTA_M:
+                    self._nav_target = (fx, fy)
             self._nav_issued_t = t
             self._actions.goto(self._nav_target)
         else:

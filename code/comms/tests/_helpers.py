@@ -48,6 +48,10 @@ class FakeActions(RobotActions):
         can_search: What :meth:`start_search` returns (False models a region with
             no reachable patrol, so the searcher should REJECT).
         can_pickup: What :meth:`pickup` returns (False models a missed grasp).
+        reconfirm_location: What :meth:`reconfirm_target` returns (a fresh
+            close-range perception fix before a pickup re-approach). ``None`` (the
+            default) models the oracle path — no fresh fix — leaving the retry's
+            goal unchanged.
     """
 
     def __init__(self, *, static_location: Optional[XY] = None,
@@ -55,6 +59,7 @@ class FakeActions(RobotActions):
                  find_after_polls: int = 0, arrives: bool = True,
                  nav_fails: bool = False, fail_reason: str = "goal unreachable",
                  can_search: bool = True, can_pickup: bool = True,
+                 reconfirm_location: Optional[XY] = None,
                  pose: XY = (0.0, 0.0), room: str = "the area") -> None:
         self.static_location = static_location
         self.search_location = search_location
@@ -64,6 +69,7 @@ class FakeActions(RobotActions):
         self.fail_reason = fail_reason
         self.can_search = can_search
         self.can_pickup = can_pickup
+        self.reconfirm_location = reconfirm_location
         self.pose = pose            # this robot's own (exactly known) pose (F3)
         self.room = room            # this robot's current region/room name (F3)
         self._searching = False
@@ -78,6 +84,10 @@ class FakeActions(RobotActions):
                 return self.search_location
             return None
         return self.static_location
+
+    def reconfirm_target(self, query) -> Optional[XY]:
+        self.log.append(("reconfirm_target", self.reconfirm_location))
+        return self.reconfirm_location
 
     def report_origin(self) -> Tuple[XY, str]:
         return (self.pose, self.room)

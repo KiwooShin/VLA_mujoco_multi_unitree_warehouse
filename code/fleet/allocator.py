@@ -134,11 +134,12 @@ def _visible_object_xy(poses: Dict[str, RobotPose], scene_cfg: dict,
             continue
         oxy = (float(obj["x"]), float(obj["y"]))
         obj_z = max(0.12, float(obj.get("size", 0.2)) / 2.0)
+        obj_radius = max(0.12, float(obj.get("size", 0.2)) / 2.0)
         for pose in poses.values():
             if not _pose_is_finite(pose):
                 continue  # a broken pose can't be scored and can't "see"
             if is_object_visible(pose.xy, pose.yaw, pose.base_height, oxy, walls,
-                                 obj_z=obj_z, cfg=vis_cfg):
+                                 obj_z=obj_z, obj_radius=obj_radius, cfg=vis_cfg):
                 return oxy
     return None
 

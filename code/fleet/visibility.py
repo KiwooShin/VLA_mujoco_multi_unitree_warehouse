@@ -46,6 +46,15 @@ _MIN_OCCLUDER_H: float = 0.25
 # occludes it.
 _DEFAULT_OBJ_Z: float = 0.12
 
+# Nominal object planar half-extent (m) when the object's size is unknown. The
+# visibility oracle samples the object's extent (centre + 4 cardinal edge points
+# at this radius) so a *partially* visible object — an edge peeking past a wall —
+# is labelled visible rather than hidden (a single centre-point segment mislabels
+# it, the "through-wall FP" the perception-eval decomposition traced to genuine
+# partial visibility). Warehouse objects are ~0.2-0.26 m across, so ~0.12 m is a
+# faithful default half-extent; callers that know the object size pass it through.
+_DEFAULT_OBJ_RADIUS: float = 0.12
+
 
 def head_half_fov_rad(fovy_deg: float = EGO_FOVY, w: int = EGO_W,
                       h: int = EGO_H) -> float:
@@ -118,26 +127,15 @@ def _segment_intersects_wall(p0: XY, p1: XY, wall: Dict[str, float]) -> bool:
                                     float(wall["half_x"]), float(wall["half_y"]))
 
 
-def line_of_sight_clear(head_xy: XY, obj_xy: XY,
-                        walls: Sequence[Dict[str, float]], *,
-                        head_z: float, obj_z: float) -> bool:
-    """Return whether no occluding wall lies between a head point and an object.
+def _segment_los_clear(head_xy: XY, obj_xy: XY,
+                       walls: Sequence[Dict[str, float]], *,
+                       head_z: float, obj_z: float) -> bool:
+    """Whether no occluding wall lies on the single head->point 2-D segment.
 
     A wall blocks the sightline when its footprint intersects the 2-D
-    head->object segment AND its top rises above the lower of the two endpoint
+    head->point segment AND its top rises above the lower of the two endpoint
     heights (so a wall shorter than both endpoints — e.g. a low crate — never
     occludes). Objects and robots are never occluders (walls only).
-
-    Args:
-        head_xy: Camera/head world (x, y).
-        obj_xy: Object world (x, y).
-        walls: Serialized wall dicts (``cx``/``cy``/``half_x``/``half_y``/``yaw``/
-            ``height``), e.g. ``scene_cfg["walls"]``.
-        head_z: Camera height (m).
-        obj_z: Object centre height (m).
-
-    Returns:
-        True if the line of sight is unobstructed.
     """
     sightline_floor = min(head_z, obj_z)
     for wall in walls:
@@ -146,6 +144,45 @@ def line_of_sight_clear(head_xy: XY, obj_xy: XY,
         if _segment_intersects_wall(head_xy, obj_xy, wall):
             return False
     return True
+
+
+def line_of_sight_clear(head_xy: XY, obj_xy: XY,
+                        walls: Sequence[Dict[str, float]], *,
+                        head_z: float, obj_z: float,
+                        obj_radius: float = _DEFAULT_OBJ_RADIUS) -> bool:
+    """Return whether the object is at least *partially* in clear line of sight.
+
+    Samples the object's planar extent: the centre plus four cardinal edge points
+    at ``obj_radius`` (``(+r,0) (-r,0) (0,+r) (0,-r)``). The object is visible if
+    the centre **or any** edge sample has an unobstructed sightline. A single
+    centre-point segment (``obj_radius <= 0``) mislabels a partially visible
+    object — an edge sticking past a wall — as hidden; the extent sampling fixes
+    that (the perception-eval "through-wall FP" decomposition showed those frames
+    were genuine partial visibility, not detector hallucinations).
+
+    Args:
+        head_xy: Camera/head world (x, y).
+        obj_xy: Object world (x, y).
+        walls: Serialized wall dicts (``cx``/``cy``/``half_x``/``half_y``/``yaw``/
+            ``height``), e.g. ``scene_cfg["walls"]``.
+        head_z: Camera height (m).
+        obj_z: Object centre height (m).
+        obj_radius: Object planar half-extent to sample (m); ``<= 0`` reduces to
+            the historical centre-only test.
+
+    Returns:
+        True if the line of sight to the centre or any sampled edge is unobstructed.
+    """
+    if _segment_los_clear(head_xy, obj_xy, walls, head_z=head_z, obj_z=obj_z):
+        return True
+    r = float(obj_radius)
+    if r <= 0.0:
+        return False
+    ox, oy = float(obj_xy[0]), float(obj_xy[1])
+    for sample in ((ox + r, oy), (ox - r, oy), (ox, oy + r), (ox, oy - r)):
+        if _segment_los_clear(head_xy, sample, walls, head_z=head_z, obj_z=obj_z):
+            return True
+    return False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -170,11 +207,14 @@ class VisibilityConfig:
 def is_object_visible(robot_xy: XY, robot_yaw: float, base_height: float,
                       obj_xy: XY, walls: Sequence[Dict[str, float]], *,
                       obj_z: float = _DEFAULT_OBJ_Z,
+                      obj_radius: float = _DEFAULT_OBJ_RADIUS,
                       cfg: Optional[VisibilityConfig] = None) -> bool:
     """Return whether a robot can see an object under the geometric oracle.
 
     Applies the three gates in cheap-first order: range, then horizontal FOV,
-    then line of sight (the only test that touches every wall).
+    then line of sight. Range and FOV are tested on the object *centre* (its
+    localisation point); the line-of-sight test samples the object's planar
+    extent so a partially visible object (an edge past a wall) counts as visible.
 
     Args:
         robot_xy: Robot pelvis world (x, y).
@@ -183,10 +223,12 @@ def is_object_visible(robot_xy: XY, robot_yaw: float, base_height: float,
         obj_xy: Object world (x, y).
         walls: Serialized wall dicts (``scene_cfg["walls"]``).
         obj_z: Object centre height (m).
+        obj_radius: Object planar half-extent for the sampled LOS (m).
         cfg: Oracle geometry (defaults to :class:`VisibilityConfig`).
 
     Returns:
-        True iff the object is in range, within FOV and in clear line of sight.
+        True iff the object centre is in range and FOV and at least part of the
+        object is in clear line of sight.
     """
     cfg = cfg or VisibilityConfig()
     dx = obj_xy[0] - robot_xy[0]
@@ -200,7 +242,7 @@ def is_object_visible(robot_xy: XY, robot_yaw: float, base_height: float,
             return False
     head_z = cfg.head_z(base_height)
     return line_of_sight_clear(robot_xy, obj_xy, walls,
-                               head_z=head_z, obj_z=obj_z)
+                               head_z=head_z, obj_z=obj_z, obj_radius=obj_radius)
 
 
 def first_visible(robot_xy: XY, robot_yaw: float, base_height: float,
@@ -222,8 +264,9 @@ def first_visible(robot_xy: XY, robot_yaw: float, base_height: float,
     """
     for i, obj in enumerate(objects):
         obj_z = max(_DEFAULT_OBJ_Z, float(obj.get("size", 0.2)) / 2.0)
+        obj_radius = max(_DEFAULT_OBJ_RADIUS, float(obj.get("size", 0.2)) / 2.0)
         if is_object_visible(robot_xy, robot_yaw, base_height,
                              (float(obj["x"]), float(obj["y"])), walls,
-                             obj_z=obj_z, cfg=cfg):
+                             obj_z=obj_z, obj_radius=obj_radius, cfg=cfg):
             return i
     return None

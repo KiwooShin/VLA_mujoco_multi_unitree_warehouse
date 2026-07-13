@@ -131,9 +131,26 @@ class FleetRobotActions(RobotActions):
             obj = objects[i]
             oxy = (float(obj["x"]), float(obj["y"]))
             obj_z = max(0.12, float(obj.get("size", 0.2)) / 2.0)
-            if is_object_visible(xy, yaw, h, oxy, walls, obj_z=obj_z, cfg=self._vis):
+            obj_radius = max(0.12, float(obj.get("size", 0.2)) / 2.0)
+            if is_object_visible(xy, yaw, h, oxy, walls, obj_z=obj_z,
+                                 obj_radius=obj_radius, cfg=self._vis):
                 return self._confirm(query, oxy)
         return None
+
+    def reconfirm_target(self, query: ObjectQuery) -> Optional[XY]:
+        """Force a fresh close-range detector fix on the target (groundnet only).
+
+        The protocol calls this before a pickup re-approach (D-14): re-running the
+        learned detector from the robot's current, close pose yields a fresh
+        world-xy estimate that supersedes a stale/off reported point. In oracle
+        mode (no perception) this returns ``None`` so the re-approach keeps its
+        current goal and the oracle path stays byte-identical. Delegates to
+        :meth:`can_see`, which applies the same oracle gate + detector confirm and
+        returns the detector's own estimate (or the oracle xy on a detector miss).
+        """
+        if self._perception is None:
+            return None
+        return self.can_see(query)
 
     def _confirm(self, query: ObjectQuery, oracle_xy: XY) -> XY:
         """Confirm an oracle-visible sighting with the detector (groundnet mode).

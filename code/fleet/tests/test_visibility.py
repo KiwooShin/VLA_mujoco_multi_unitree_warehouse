@@ -87,6 +87,65 @@ class TestLineOfSight(unittest.TestCase):
                                                head_z=1.2, obj_z=0.1))
 
 
+class TestPartialVisibilitySampledLOS(unittest.TestCase):
+    """Extent-sampled LOS: an edge peeking past a wall counts as visible.
+
+    Hand-built wall: head at the origin looking +x at an object 2 m away; a thin
+    tall wall crosses the centre sightline (y=0) but ends just below it, so the
+    object's +y edge (at its radius) clears the wall.
+    """
+
+    # Blocks the y=0 centre segment (covers y in [-1.0, +0.05]) but not y=+0.1.
+    _EDGE_WALL = [{"cx": 1.0, "cy": -0.475, "half_x": 0.1, "half_y": 0.525,
+                   "yaw": 0.0, "height": 2.0}]
+    # Covers y in [-1, 1]: blocks the centre AND every edge sample.
+    _FULL_WALL = [{"cx": 1.0, "cy": 0.0, "half_x": 0.1, "half_y": 1.0,
+                   "yaw": 0.0, "height": 2.0}]
+
+    def test_centre_only_hidden_but_edge_visible(self) -> None:
+        # Centre-only (radius 0) segment is blocked...
+        self.assertFalse(V.line_of_sight_clear((0, 0), (2, 0), self._EDGE_WALL,
+                                               head_z=1.2, obj_z=0.1,
+                                               obj_radius=0.0))
+        # ...but sampling the 0.2 m extent finds the +y edge peeking past the wall.
+        self.assertTrue(V.line_of_sight_clear((0, 0), (2, 0), self._EDGE_WALL,
+                                              head_z=1.2, obj_z=0.1,
+                                              obj_radius=0.2))
+
+    def test_is_object_visible_uses_sampled_extent(self) -> None:
+        self.assertFalse(
+            V.is_object_visible((0, 0), 0.0, _H, (2, 0), self._EDGE_WALL,
+                                obj_z=0.1, obj_radius=0.0))
+        self.assertTrue(
+            V.is_object_visible((0, 0), 0.0, _H, (2, 0), self._EDGE_WALL,
+                                obj_z=0.1, obj_radius=0.2))
+
+    def test_fully_occluded_stays_hidden_even_with_radius(self) -> None:
+        # A wall wider than the object's extent blocks every sample.
+        self.assertFalse(V.line_of_sight_clear((0, 0), (2, 0), self._FULL_WALL,
+                                               head_z=1.2, obj_z=0.1,
+                                               obj_radius=0.2))
+        self.assertFalse(
+            V.is_object_visible((0, 0), 0.0, _H, (2, 0), self._FULL_WALL,
+                                obj_z=0.1, obj_radius=0.2))
+
+    def test_fov_and_range_gate_on_centre_not_edge(self) -> None:
+        # An object whose CENTRE is behind the robot stays hidden however big its
+        # extent — the FOV/range gates use the centre, only LOS samples the edges.
+        self.assertFalse(
+            V.is_object_visible((0, 0), 0.0, _H, (-2, 0), [], obj_radius=0.3))
+        # And a centre beyond range is hidden regardless of extent.
+        self.assertFalse(
+            V.is_object_visible((0, 0), 0.0, _H, (7.0, 0.0), [], obj_radius=0.3))
+
+    def test_open_object_visible_with_or_without_sampling(self) -> None:
+        # No walls: visible either way (sampling never narrows the gate).
+        self.assertTrue(V.line_of_sight_clear((0, 0), (2, 0), [], head_z=1.2,
+                                              obj_z=0.1, obj_radius=0.0))
+        self.assertTrue(V.line_of_sight_clear((0, 0), (2, 0), [], head_z=1.2,
+                                              obj_z=0.1, obj_radius=0.2))
+
+
 class TestSegmentGeometry(unittest.TestCase):
     def test_segment_aabb_hit_and_miss(self) -> None:
         self.assertTrue(V._segment_intersects_aabb(-2, 0, 2, 0, 1, 1))

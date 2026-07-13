@@ -75,6 +75,15 @@ CONFIRM_RANGE_M: float = 7.0
 # object can be oracle-visible yet outside the grounding frame; the confirmer
 # only runs the detector within THIS narrower, honest field of view.
 GROUNDING_HALF_FOV_DEG: float = 28.0
+# Minimum detector confidence for a fresh approach confirmation to STEER the
+# owner's fetch goal (D-14 close-range goal refinement). Higher than the bare
+# confirmation floor (CONFIRM_TAU) because a refinement re-plans the navigation
+# goal, so it should only follow a well-framed, confident close-range look; any
+# accepted confirmation is already geometry-consistent with the occlusion-truth
+# hypothesis (range+bearing gates), so this is a belt-and-suspenders floor.
+# Warehouse fine-tune confidence is p50 ~0.89, so genuine close-range looks clear
+# it comfortably while the weakest edge-of-frame detections are ignored.
+REFINE_MIN_CONF: float = 0.30
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 # The warehouse-domain fine-tune (Cycle-2b, this task) and the original

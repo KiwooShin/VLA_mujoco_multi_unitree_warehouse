@@ -29,17 +29,22 @@ import numpy as np
 # Robot callsigns and their demo accent colours (helmet/pad tint per robot).
 # ---------------------------------------------------------------------------
 CALLSIGNS: Tuple[str, ...] = ("Alpha", "Bravo", "Charlie", "Delta")
+# Home-bay floor pads: each robot's identity colour, slightly desaturated (moved
+# toward mid-gray) so the pads read as calm industrial floor markings rather than
+# neon on video. Robot torso accents (code.fleet.viz.ACCENT_RGBA) stay vivid so
+# the robots themselves remain easy to track.
 _BAY_RGBA: Dict[str, Tuple[float, float, float, float]] = {
-    "Alpha": (0.86, 0.16, 0.16, 0.55),    # red
-    "Bravo": (0.20, 0.35, 0.86, 0.55),    # blue
-    "Charlie": (0.92, 0.80, 0.16, 0.55),  # yellow
-    "Delta": (0.59, 0.24, 0.78, 0.55),    # purple
+    "Alpha": (0.78, 0.30, 0.30, 0.50),    # red
+    "Bravo": (0.34, 0.44, 0.78, 0.50),    # blue
+    "Charlie": (0.80, 0.72, 0.34, 0.50),  # yellow
+    "Delta": (0.56, 0.38, 0.70, 0.50),    # purple
 }
 
 _PERIM_RGBA: Tuple[float, float, float, float] = (0.74, 0.75, 0.78, 1.0)
 _SHELF_RGBA: Tuple[float, float, float, float] = (0.55, 0.40, 0.24, 1.0)
 _PART_RGBA: Tuple[float, float, float, float] = (0.62, 0.64, 0.68, 1.0)
-_DELIVERY_RGBA: Tuple[float, float, float, float] = (0.20, 0.72, 0.32, 0.55)
+# Delivery pad: a clear, readable green — clearly the destination, not neon.
+_DELIVERY_RGBA: Tuple[float, float, float, float] = (0.30, 0.60, 0.40, 0.52)
 
 # Validity thresholds (metres).
 _MIN_AISLE_M: float = 2.2

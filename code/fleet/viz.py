@@ -51,6 +51,7 @@ from code.warehouse.arena import (
     _add_overhead_lights,
     _add_wall,
     _add_zone,
+    _apply_floor,
 )
 
 # Per-callsign torso accent colours (docs/multi_plan.md sec 3): Alpha red,
@@ -139,12 +140,15 @@ def _warehouse_base_spec(scene_cfg: dict) -> mujoco.MjSpec:
         _add_zone(wb, zone)
 
     try:
-        spec.visual.headlight.ambient = [0.5, 0.5, 0.5]
-        spec.visual.headlight.diffuse = [0.5, 0.5, 0.5]
-        spec.visual.headlight.specular = [0.2, 0.2, 0.2]
+        # Match build_warehouse_arena: soft warm-neutral ambient, the directional
+        # overheads supply the shape/shadows so both models render identically.
+        spec.visual.headlight.ambient = [0.30, 0.29, 0.27]
+        spec.visual.headlight.diffuse = [0.12, 0.12, 0.11]
+        spec.visual.headlight.specular = [0.0, 0.0, 0.0]
     except Exception:
         pass
     _add_overhead_lights(wb, 8.0, 6.0)
+    _apply_floor(spec)
     return spec
 
 

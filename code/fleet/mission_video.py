@@ -40,6 +40,9 @@ from code.warehouse.layout import hero_layout
 Point = Tuple[float, float]
 _DEFAULT_OUT = str(_REPO / "ops" / "phase4")
 _CMAP = dict(COLORS)
+# Seconds of simulated time per control step (50 Hz control loop) — drives the
+# "sim time" HUD readout.
+_SIM_DT: float = 0.02
 
 # Per-sender overlay colours in BGR (cv2 order).
 _SENDER_BGR: Dict[str, Tuple[int, int, int]] = {
@@ -68,8 +71,10 @@ _FILLER = (("orange", "cube", 0.24), ("blue", "cylinder", 0.22),
            ("blue", "ball", 0.24))
 
 # Target spot per scenario (hero layout): A visible to Alpha, B visible to a
-# peer only, C hidden from all (NE alcove) -> full delegated search.
-_SCENARIO_SPOT: Dict[str, int] = {"A": 6, "B": 7, "C": 5}
+# peer only, C hidden from all (NE alcove) -> full delegated search, D uses the
+# peer-visible spot for a fleet-addressed allocator demo (the path-shortest robot
+# — a peer, not Alpha — wins and executes).
+_SCENARIO_SPOT: Dict[str, int] = {"A": 6, "B": 7, "C": 5, "D": 7}
 
 
 def _build_objects(spot: int) -> List[dict]:
@@ -180,7 +185,7 @@ def draw_overlay(frame: np.ndarray, cam: bevmod.BevCamera, mr: MissionRunner,
         bevmod.draw_marker(frame, cam, tgt, color=(255, 255, 255), radius=r + 3,
                            z=0.3)
 
-    hud = [f"step {t}   {mr.phase()}"]
+    hud = [f"sim time {t * _SIM_DT:5.1f} s   step {t}   {mr.phase()}"]
     if mr.task is not None:
         hud.append(f"task: fetch the {mr.task.query.describe()} -> {mr.task.destination_name}")
     bevmod.put_hud(frame, hud)
@@ -200,7 +205,11 @@ def record_mission_video(scenario: str, out_dir: str, *, decimation: int,
     cam = bevmod.fit_bev_camera(mr.layout.hall_x, mr.layout.hall_y,
                                 width=BEV_W, height=BEV_H,
                                 fovy_deg=float(viz.model.vis.global_.fovy))
-    mr.submit("Alpha, fetch the red cube to the delivery pad")
+    if scenario == "D":
+        # Fleet-addressed order: the allocator (not the user) chooses the robot.
+        mr.submit("someone bring me the red cube")
+    else:
+        mr.submit("Alpha, fetch the red cube to the delivery pad")
 
     frames: List[np.ndarray] = []
 
@@ -237,7 +246,7 @@ def record_mission_video(scenario: str, out_dir: str, *, decimation: int,
 
 def main(argv: Optional[List[str]] = None) -> None:
     ap = argparse.ArgumentParser(description="Flagship collaborative-fetch video")
-    ap.add_argument("--scenario", choices=("A", "B", "C"), default="C")
+    ap.add_argument("--scenario", choices=("A", "B", "C", "D"), default="C")
     ap.add_argument("--out", type=str, default=_DEFAULT_OUT)
     ap.add_argument("--decimation", type=int, default=4)
     ap.add_argument("--fps", type=int, default=30)

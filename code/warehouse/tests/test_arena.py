@@ -136,7 +136,13 @@ class TestBuildWarehouseArena(unittest.TestCase):
                                    [0.86, 0.86, 0.88, 1.0], atol=1e-6)
 
     def test_overhead_lights_added(self) -> None:
-        self.assertGreaterEqual(self.model.nlight, 5)  # 1 g1 + 4 overhead
+        # The G1 XML's own light is stripped and replaced by the shared overhead
+        # rig (key + fill directional lights) so lighting matches the fleet viz.
+        self.assertGreaterEqual(self.model.nlight, 2)
+        directional = int(mujoco.mjtLightType.mjLIGHT_DIRECTIONAL)
+        self.assertTrue(
+            (self.model.light_type[:] == directional).any(),
+            "expected at least one directional overhead light")
 
     def test_yawed_wall_has_rotation_quat(self) -> None:
         # All hero walls are axis-aligned, so the build path must at least

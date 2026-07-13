@@ -42,7 +42,24 @@ from code.warehouse.layout import WarehouseLayout
 _STOP_R: float = 0.4
 _HORIZON: int = 1400
 _AMBIENT: float = 0.5
+
+# ---------------------------------------------------------------------------
+# Floor appearance (shared by the single-robot and fleet viz models).
+#
+# The G1 XML ships a blue "checker" groundplane texture/material on its ``floor``
+# plane geom; ``geom_rgba`` alone cannot override a *textured* material, so the
+# floor kept reading blue in the single-robot BEV. :func:`_apply_floor` recolours
+# that texture (or builds a matching one on the fresh fleet-viz spec) to a clean
+# light-gray industrial tile with faint large-scale grid lines and no
+# reflectance. ``geom_rgba`` is still pinned to ``_FLOOR_RGBA`` after compile
+# (it modulates the texture and keeps the floor-colour contract/test stable).
+# ---------------------------------------------------------------------------
 _FLOOR_RGBA: List[float] = [0.86, 0.86, 0.88, 1.0]
+_FLOOR_TILE1: List[float] = [0.96, 0.96, 0.98]   # light tile
+_FLOOR_TILE2: List[float] = [0.90, 0.90, 0.93]   # subtly darker tile
+_FLOOR_GRID_RGB: List[float] = [0.74, 0.75, 0.80]  # faint grid line (tile edges)
+_FLOOR_TEXREPEAT: float = 0.8   # ~2 m tiles over the 16x12 m hall (large-scale)
+_FLOOR_REFLECTANCE: float = 0.0  # matte — no blown speculars at the BEV angle
 
 
 # ---------------------------------------------------------------------------
@@ -232,22 +249,79 @@ def _add_zone(wb: mujoco.MjsBody, zone: dict) -> None:
     g.conaffinity = 0
 
 
+def _apply_floor(spec: mujoco.MjSpec) -> None:
+    """Give the ``floor`` geom a clean light-gray industrial look (no blue checker).
+
+    Recolours the G1 XML's ``groundplane`` checker texture (or creates a matching
+    one on the fresh fleet-viz spec) to two near-identical light grays with faint
+    edge grid lines, binds a matte ``groundplane`` material to the ``floor`` geom,
+    and drops the reflectance. Shared by both warehouse model variants so the
+    single-robot BEV and the fleet viz render one identical clean floor.
+
+    Args:
+        spec: A spec that already contains a geom named ``"floor"`` (the G1 base
+            spec or the fleet-viz base spec). Mutated in place.
+    """
+    tex = next((t for t in spec.textures if t.name == "groundplane"), None)
+    if tex is None:
+        tex = spec.add_texture()
+        tex.name = "groundplane"
+    tex.type = mujoco.mjtTexture.mjTEXTURE_2D
+    tex.builtin = mujoco.mjtBuiltin.mjBUILTIN_CHECKER
+    tex.mark = mujoco.mjtMark.mjMARK_EDGE
+    tex.width = 512
+    tex.height = 512
+    tex.rgb1 = list(_FLOOR_TILE1)
+    tex.rgb2 = list(_FLOOR_TILE2)
+    tex.markrgb = list(_FLOOR_GRID_RGB)
+
+    mat = next((m for m in spec.materials if m.name == "groundplane"), None)
+    if mat is None:
+        mat = spec.add_material()
+        mat.name = "groundplane"
+    mat.textures[mujoco.mjtTextureRole.mjTEXROLE_RGB] = "groundplane"
+    mat.texuniform = True
+    mat.texrepeat = [_FLOOR_TEXREPEAT, _FLOOR_TEXREPEAT]
+    mat.reflectance = _FLOOR_REFLECTANCE
+
+    for g in spec.worldbody.geoms:
+        if g.name == "floor":
+            g.material = "groundplane"
+
+
 def _add_overhead_lights(wb: mujoco.MjsBody, half_x: float,
                          half_y: float) -> None:
-    """Add four overhead spot lights for an even industrial look."""
-    for sx in (-0.5, 0.5):
-        for sy in (-0.5, 0.5):
-            try:
-                light = wb.add_light()
-                light.pos = [sx * half_x, sy * half_y, 6.0]
-                light.dir = [0.0, 0.0, -1.0]
-                light.type = mujoco.mjtLightType.mjLIGHT_SPOT
-                light.cutoff = 80.0
-                light.exponent = 4.0
-                light.diffuse = [0.45, 0.45, 0.45]
-                light.specular = [0.15, 0.15, 0.15]
-            except Exception:
-                return  # older mujoco spec API — headlight alone suffices
+    """Add even, warm-neutral overhead illumination with soft shadows.
+
+    Uses two *directional* lights instead of positional spot lights: a warm-neutral
+    key light that casts soft shadows and a cooler opposite fill that lifts the
+    shadows without a second shadow. Directional lights have no positional falloff,
+    so the floor is lit evenly across the whole hall (no bright spot "star" pattern
+    or blown speculars at the BEV angle). Both warehouse model variants call this,
+    so their lighting is identical.
+
+    Args:
+        wb: Worldbody spec to add the lights to.
+        half_x: Hall half-extent along x (m) — only used to place the shadow frusta.
+        half_y: Hall half-extent along y (m).
+    """
+    try:
+        key = wb.add_light()
+        key.pos = [0.3 * half_x, -0.2 * half_y, 8.0]
+        key.dir = [-0.25, 0.18, -1.0]
+        key.type = mujoco.mjtLightType.mjLIGHT_DIRECTIONAL
+        key.diffuse = [0.55, 0.53, 0.48]   # warm-neutral
+        key.specular = [0.05, 0.05, 0.05]
+        key.castshadow = True
+        fill = wb.add_light()
+        fill.pos = [-0.3 * half_x, 0.2 * half_y, 8.0]
+        fill.dir = [0.25, -0.18, -1.0]
+        fill.type = mujoco.mjtLightType.mjLIGHT_DIRECTIONAL
+        fill.diffuse = [0.22, 0.22, 0.24]  # cool fill, no second shadow
+        fill.specular = [0.0, 0.0, 0.0]
+        fill.castshadow = False
+    except Exception:
+        return  # older mujoco spec API — headlight alone suffices
 
 
 def build_warehouse_arena(scene_cfg: dict) -> mujoco.MjModel:
@@ -271,6 +345,12 @@ def build_warehouse_arena(scene_cfg: dict) -> mujoco.MjModel:
     except Exception:
         pass  # older mujoco — ignore
 
+    # Strip the G1 XML's own directional light so this model's illumination is
+    # controlled entirely by the headlight + overhead lights below — identical to
+    # the fleet viz model (which strips every child robot's light on attach).
+    for light in list(spec.lights):
+        spec.delete(light)
+
     wb = spec.worldbody
 
     for wall in scene_cfg.get("walls", []):
@@ -282,13 +362,16 @@ def build_warehouse_arena(scene_cfg: dict) -> mujoco.MjModel:
 
     ambient = float(scene_cfg.get("lighting", {}).get("ambient", _AMBIENT))
     try:
-        spec.visual.headlight.ambient = [ambient, ambient, ambient]
-        spec.visual.headlight.diffuse = [0.5, 0.5, 0.5]
-        spec.visual.headlight.specular = [0.2, 0.2, 0.2]
+        # Soft warm-neutral ambient; the directional overheads supply the shape.
+        spec.visual.headlight.ambient = [ambient * 0.6, ambient * 0.58,
+                                         ambient * 0.54]
+        spec.visual.headlight.diffuse = [0.12, 0.12, 0.11]
+        spec.visual.headlight.specular = [0.0, 0.0, 0.0]
     except Exception:
         pass
 
     _add_overhead_lights(wb, 8.0, 6.0)
+    _apply_floor(spec)
 
     model = spec.compile()
 

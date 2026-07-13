@@ -31,6 +31,8 @@ MUJOCO_LOG.TXT
 videos/
 *.mp4
 *.avi
+# Exception: the compressed Phase-5 hero gallery clips ARE committed deliverables.
+!assets/gallery/*.mp4
 
 # Packaging / archives
 *.zip

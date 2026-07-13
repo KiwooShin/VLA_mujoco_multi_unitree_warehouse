@@ -46,6 +46,8 @@ from code.warehouse.layout import CALLSIGNS, hero_layout
 
 Point = Tuple[float, float]
 _DEFAULT_OUT = str(_REPO / "ops" / "phase2")
+# Seconds of simulated time per control step (50 Hz control loop) — HUD readout.
+_SIM_DT: float = 0.02
 
 # Per-callsign overlay colours in BGR (cv2 order), matching the torso accents.
 ACCENT_BGR: Dict[str, Tuple[int, int, int]] = {
@@ -91,7 +93,8 @@ def draw_fleet_overlay(frame: np.ndarray, cam: bevmod.BevCamera, fleet: Fleet,
         cv2.putText(frame, name, (u - 22, v), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
                     color, 1, cv2.LINE_AA)
 
-    hud = [f"step {fleet.step_count}  pauses {fleet.pause_events}"] + fleet.statuses()
+    hud = ([f"sim time {fleet.step_count * _SIM_DT:5.1f} s   step {fleet.step_count}"
+            f"   pauses {fleet.pause_events}"] + fleet.statuses())
     bevmod.put_hud(frame, hud)
 
 

@@ -2,6 +2,11 @@
 
 Five features for the FINAL demo videos, on top of the released gallery.
 
+> **Status (2026-07-13): all of F1–F6 are implemented, tested and shipped.**
+> See the F1–F6 STATUS addendum (§8) in [multi_plan.md](multi_plan.md) for the
+> landed commits and headline numbers, and the four `assets/gallery/final_*.mp4`
+> clips for the re-recorded multi-room demos.
+
 ## F1 — Communicating robots' camera views, emphasized
 Show robot ego views as insets; when two robots are exchanging messages
 (e.g., Alpha↔Charlie QUERY/REPORT), BOTH their camera insets are shown with
@@ -65,4 +70,10 @@ lesson). Room-aware patrols route through doorways.
 - F5 datagen starts immediately (no file conflicts with Cycle-2 agents).
 - F1-F4 batch after Cycle-2a/2b land (same files: mission_video, comms,
   actions). F3 changes code/comms payloads/formatting + tests.
-- Final videos re-recorded once F1-F5 are all in.
+- F1-F4 batch also: give MissionRunner a small PUBLIC lifecycle API
+  (reset/new-mission reuse or stepwise pump + cancel) — the web demo
+  (Cycle-2b) had to work around its absence with per-mission rebuilds
+  and a StopSim exception; keep fleet_web working when changing it.
+- Search regions + F3 room names must switch to layout.rooms when the
+  mission runs on rooms_layout (hero keeps north/middle/south thirds).
+- Final videos re-recorded once F1-F6 are all in (rooms_layout scene).

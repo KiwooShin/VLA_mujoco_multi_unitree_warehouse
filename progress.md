@@ -267,3 +267,54 @@ User specified final-demo requirements F1-F6 (docs/final_demo_spec.md) at
 | Warehouse DART dataset | 200 eps / 125,683 fr | 98.5% ep success |
 | Datagen render | 0.88 ms/frame GPU | was 160 ms on llvmpipe |
 | Suites | comms 52, fleet 120, fleet_web 43, warehouse 86 | + warehouse_demo 39 |
+
+---
+
+## 2026-07-13 01:45 — Full learned stack + final demo set (entry 6)
+
+### Done (last ~3.2 h)
+- **GROUND_NET warehouse fine-tune (8c65b91)**: new 11,630-frame warehouse
+  detector dataset (NX-6-recipe-compatible, hero+rooms scenes, wall-occluded
+  negatives from segmentation); retrained detector. Warehouse detection
+  rate 0.070 → **1.000**, xy p90 0.039 m, confidence p50 0.243 → 0.894.
+  The raw "through-wall FP" metric was decomposed frame-by-frame with
+  segmentation renders: 0 true hallucinations (the point-LOS oracle
+  mislabels partially visible objects as hidden). Ckpt auto-resolution:
+  GROUND_NET_CKPT env → warehouse_ft → original.
+- **F5 VLA locomotion (3bb34cf)**: 20-epoch fine-tune from the deployed
+  baseline policy on the warehouse DART set (val_action 0.0886→0.0612).
+  Closed-loop selection across 5 checkpoints (all 10/10; ep19 chosen).
+  Gate PASSED round 1: hero 20/20 + rooms 10/10, 0 falls, eff ≥0.994,
+  1.6 ms/step GPU inference. Deploy path replicates the baseline
+  velocity-injection recipe bit-for-bit in distribution.
+- **Final integration (07d96c9)**: locomotion=teacher|vla threaded through
+  the fleet (one shared policy, per-unit proprio windows). Interaction
+  found+fixed: VLA cannot balance a post-walk stand → held steps run WBC
+  balance, walking stays VLA (same precedent as the settle phase).
+  **Full-stack headline (rooms + fine-tuned detector + VLA): C 12/12,
+  D 3/3, 0 falls across 24 missions.** Four frame-verified FINAL videos
+  (flagship exploration, generic fleet command, 4-robot cross-room nav,
+  peer-sighting) compressed into assets/gallery/final_*.mp4 + rebuilt
+  hero_reel + mission_c.gif.
+- Known edge (documented, not scored): one unscored D-mission delivery
+  failed on a 1.7 m detector localization outlier — owner walked to the
+  reported spot, out of pickup range. Future work: close-range detector
+  re-confirmation updating the goal.
+
+### Next
+- Final release agent (running): README refresh around the learned stack,
+  gallery reorg, docs status, fresh-clone re-rehearsal incl. trained-ckpt
+  absence fallback story. Then commit + push; remaining session time goes
+  to polish/backlog (interactive rooms web demo default, oracle
+  partial-visibility upgrade, randomized-layout generalization eval).
+
+### Performance (headline, full learned stack)
+| Metric | Value | Notes |
+|---|---|---|
+| Rooms missions (C, delegated exploration) | 12/12 | groundnet + VLA, seeds 4 |
+| Allocator (D) | 3/3 | A* argmin verified |
+| Falls (all 24 full-stack missions) | 0 | |
+| Detector (warehouse) | det 1.000, conf p50 0.894 | was 0.070 / 0.243 |
+| VLA nav gate | 30/30, 0 falls | hero 2 seeds + rooms |
+| Policy inference | 1.6-1.7 ms/step | GPU |
+| Test suite | 1450 OK (7 skip) | |

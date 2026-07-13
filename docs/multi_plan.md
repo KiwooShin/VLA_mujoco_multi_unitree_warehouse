@@ -187,3 +187,34 @@ suite (1327 OK), `mission_eval --seeds 1` (3/3 A-C, 3/3 D, 0 falls),
 (2/2). All exited 0 and produced their artifacts. The rehearsal also corrected a
 stale README figure (cross-visibility, cited 6.6% pre-art-pass, reproduces ~3.3%
 on the released scene) — exactly the class of drift VR-1 exists to catch.
+
+## 8. STATUS addendum — F1–F6 final-demo cycle (2026-07-12 → 07-13)
+
+After the Phase-5 release, the user specified six final-demo requirements
+(`docs/final_demo_spec.md`, F1–F6). All six landed, plus two in-repo domain
+fine-tunes and an interactive web demo. Numbers below are the released record.
+
+| Feature | Deliverable | Status | Evidence / commit |
+|---|---|---|---|
+| F6 | Multi-room `rooms_layout` (4 named rooms, 4 open doorways, Room API = single source of truth for search regions + spoken room names) | ✅ 07-12 | 44/44 bay→spot reachability at 0.40/0.45; `8fa1782` |
+| F5-p1 | Warehouse-domain DART datagen (`code/apps/warehouse_datagen`) | ✅ 07-12 | 200 eps / 125,683 fr, 98.5% ep success; EGL GPU fix (160 ms→0.88 ms/frame); `821b06f` |
+| Cyc-2a | Real GROUND_NET detector in the mission loop (per-robot state, oracle occlusion gate + learned confirmer) | ✅ 07-12 | groundnet missions 12/12, 0 falls; measured domain-shift confidence collapse → fine-tune queued; `72eeb54` |
+| Cyc-2b | Interactive live web demo (`code/apps/fleet_web`) | ✅ 07-12 | MJPEG BEV + live transcript + command box; `ad0e206` |
+| F1–F4 | Comm-emphasized ego insets (F1), deferred target ring at reported position (F2), fixed relative-position report sentence (F3), generic fleet commands (F4); room-aware search through doorways; `MissionRunner` lifecycle API | ✅ 07-12 | rooms C 9/9 + D 3/3, hero 6/6 + 3/3, 0 falls; `4d7b43b` |
+| GN-FT | GROUND_NET **warehouse fine-tune** (11,630-frame det set, NX-6 recipe, from scratch, best ep 12) | ✅ 07-13 | detection **8.8% → 100%**, xy p90 0.037 m, confirm confidence p50 **0.243 → 0.894**, 0 through-wall hallucinations; ckpt auto-resolution (`GROUND_NET_CKPT` env → warehouse_ft → baseline); `8c65b91` |
+| F5 | **VLA locomotion backend** — 20-epoch fine-tune of the deployed distilled walk policy on the warehouse DART set; teacher `\|` vla switch on the nav engine (teacher = datagen + standing balance only) | ✅ 07-13 | val_action 0.0886 → 0.0612; closed-loop select over 5 ckpts (ep19); gate **30/30** (hero 20/20 ×2 seeds + rooms 10/10), 0 falls, eff ≥ 0.994, 1.6 ms/step; `3bb34cf` |
+| Integ | Fleet on VLA locomotion + final demo video set | ✅ 07-13 | **Full learned stack (rooms + fine-tuned detector + VLA): C 12/12, D 3/3, 0 falls across 24 missions**, 1.7 ms/step; hero 6/6 + 3/3; interaction fix (VLA walks, WBC balances held stands); four `final_*` gallery videos + rebuilt reel/GIF; `07d96c9` |
+
+**Final test suite:** 1450 tests OK (7 skip with all assets present; a fresh clone
+without the two trained fine-tunes runs 1449 OK, 11 skip).
+
+**VR-1 re-rehearsal (final release, 2026-07-13).** Fresh `git clone` with only
+`third_party/` + `runs/nx6_heatmap_B/` symlinked (the two trained fine-tunes
+deliberately absent) verified the documented fallback story end-to-end: full suite
+(1449 OK, 11 skip), `mission_eval --layout rooms --seeds 1` (oracle+teacher, C 2/2
++ D 3/3, 0 falls), `mission_video --scenario C --layout rooms` (complete, on-pad,
+0 falls), `fleet_web` (served, one addressed command completed, clean kill). Then
+symlinking the two trained-ckpt dirs (simulating "after training") the full learned
+stack ran: `mission_eval --layout rooms --perception groundnet --locomotion vla
+--seeds 1`. All exited 0. Confirms fresh clones run every demo in the
+teacher/oracle fallback and upgrade cleanly once the checkpoints exist.

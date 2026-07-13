@@ -318,3 +318,42 @@ User specified final-demo requirements F1-F6 (docs/final_demo_spec.md) at
 | VLA nav gate | 30/30, 0 falls | hero 2 seeds + rooms |
 | Policy inference | 1.6-1.7 ms/step | GPU |
 | Test suite | 1450 OK (7 skip) | |
+
+---
+
+## 2026-07-13 04:20 — Release refresh + hardening + generalization (entry 7)
+
+### Done (last ~2.5 h)
+- **Final release refresh (c4b6b80)**: README rewritten around the learned
+  stack (416 lines) — final videos first, real transcript with the exact
+  relative-position sentence, updated honest-assumptions box, full-stack
+  results, NEW training section with reproducible commands, ckpt
+  auto-resolution + fresh-clone fallback documented. Fresh-clone VR-1
+  re-rehearsal: every documented command exit 0 BOTH without trained ckpts
+  (teacher/oracle fallback) and with them (full stack).
+- **Perception precision (347a0d3)**: (1) D-14 fixed — approach
+  confirmations refine the in-flight goal + pickup retry reconfirms from
+  close range; the exact previously-failing mission now completes
+  (same seed). Rooms full stack now 12/12 + 3/3 with ZERO residual
+  failures. (2) Visibility oracle samples object extent (edge-visible
+  counts); the 17 "through-wall FPs" root-caused as physically-invalid
+  camera poses (inside shelves) — valid-pose gate added; genuine
+  occlusion FP rate: 0.000. Determinism byte-identical. +19 tests.
+- **Generalization eval (in flight)**: sample_rooms_layout() +
+  reachability-gated sample_layout (found+fixed: ~30% of ungated hero
+  draws sealed the alcove); gen_eval CLI sweeping 8+8 randomized layouts
+  × 3 seeds × both stacks (~200 missions). Rooms family COMPLETE (rc=0);
+  hero family running. +20 tests; suite 1489 OK.
+
+### Next
+- Generalization tables → README summary table + commit.
+- Remaining backlog if time: space-time reservations, 6-8 robots,
+  rooms-default web demo.
+
+### Performance
+| Metric | Value | Notes |
+|---|---|---|
+| Full stack after fixes | 12/12 C + 3/3 D, 0 fails | rooms, seeds 4 |
+| Recovered mission | D seed=102: failed → complete | same-seed proof |
+| Occlusion FP (valid poses) | 0.000 | was 0.262 raw / mislabeled |
+| Test suite | 1489 OK (7 skip) | +39 since release |

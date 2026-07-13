@@ -36,8 +36,14 @@ from code.comms.messages import Message, ObjectQuery, Performative, TaskSpec
 
 XY = Tuple[float, float]
 
-# Default region labels handed to searchers, partitioning the hall.
-DEFAULT_REGIONS: Tuple[str, ...] = ("north", "south", "east", "west")
+# How many times a missed mock pickup is re-attempted (re-approach) before the
+# owner declares the fetch failed. One retry is enough for a transient miss.
+MAX_PICKUP_RETRIES: int = 1
+
+# Default region labels handed to searchers, partitioning the hall. These MUST
+# be regions that :func:`code.fleet.search.region_bounds` understands, otherwise
+# a default-constructed protocol crashes the moment it delegates a search.
+DEFAULT_REGIONS: Tuple[str, ...] = ("north", "middle", "south")
 
 
 # ---------------------------------------------------------------------------
@@ -67,7 +73,10 @@ class RobotActions(abc.ABC):
 
     Navigation (:meth:`goto`, :meth:`deliver`) is asynchronous: it kicks off
     motion and returns immediately; the protocol polls :meth:`arrived` on later
-    steps to learn when the most recently issued target has been reached.
+    steps to learn when the most recently issued target has been reached, or
+    :meth:`failed` to learn that it can no longer make progress (the robot fell
+    or the goal is unreachable) so a stuck task fails fast instead of burning the
+    whole step budget.
     """
 
     @abc.abstractmethod
@@ -82,17 +91,41 @@ class RobotActions(abc.ABC):
     def arrived(self) -> bool:
         """Return whether the most recently issued nav target has been reached."""
 
+    def failed(self) -> bool:
+        """Return whether the robot can no longer make navigation progress.
+
+        True when the robot has fallen or its most recent goto/deliver goal is
+        unreachable (and cannot be re-planned). The base implementation returns
+        ``False`` so scripted test fakes and any always-succeeding backend stay
+        valid without overriding it.
+        """
+        return False
+
+    def failure_reason(self) -> str:
+        """Return a short human reason for the current :meth:`failed` state."""
+        return "navigation failed"
+
     @abc.abstractmethod
-    def start_search(self, query: ObjectQuery, region: str) -> None:
-        """Begin searching a named region for the object (asynchronous)."""
+    def start_search(self, query: ObjectQuery, region: str) -> bool:
+        """Begin searching a named region for the object (asynchronous).
+
+        Returns:
+            True if a coverable patrol was started; False if the region has no
+            reachable patrol (the caller should decline the assignment).
+        """
 
     @abc.abstractmethod
     def abort_search(self) -> None:
         """Stop any in-progress search immediately."""
 
     @abc.abstractmethod
-    def pickup(self, query: ObjectQuery) -> None:
-        """Pick up the object (mock grasp; robot must be within reach)."""
+    def pickup(self, query: ObjectQuery) -> bool:
+        """Pick up the object (mock grasp; robot must be within reach).
+
+        Returns:
+            True if the object is now held; False if the grasp missed (out of
+            reach) so the caller can re-approach or fail the task.
+        """
 
     @abc.abstractmethod
     def deliver(self, destination_xy: XY) -> None:
@@ -158,6 +191,8 @@ class RobotProtocol:
         self._peer_region: Dict[str, str] = {}
         self._search_deadline = 0
         self._nav_issued_t = 0
+        self._nav_target: Optional[XY] = None  # object location for pickup re-approach
+        self._pickup_retries = 0
 
         # Helper-role bookkeeping.
         self._assist: Optional[_AssistCtx] = None
@@ -277,11 +312,19 @@ class RobotProtocol:
             self._searchers.add(msg.sender)
 
     def _on_reject(self, msg: Message, t: int) -> None:
+        """Handle a peer declining/abandoning a search command.
+
+        Fires both for a peer that rejects the initial ``COMMAND_SEARCH`` (busy
+        or an uncoverable region) and for a searcher that had already ACCEPTed
+        but can no longer continue (e.g. it fell). In either case the peer is
+        dropped and its region is re-planned onto a reserve peer if one is free.
+        """
         if self._state is not RobotState.OWNER_DELEGATING:
             return
-        if msg.sender not in self._pending_accept:
-            return
+        if msg.sender not in self._pending_accept and msg.sender not in self._searchers:
+            return  # stale / not one of ours
         self._pending_accept.discard(msg.sender)
+        self._searchers.discard(msg.sender)
         region = self._peer_region.get(msg.sender)
         # Re-plan: hand the rejected peer's region to a reserve peer, if any.
         if region is not None and self._reserve:
@@ -307,6 +350,8 @@ class RobotProtocol:
     def _begin_navigation(self, location: XY, t: int) -> None:
         self._state = RobotState.OWNER_NAVIGATING
         self._nav_issued_t = t
+        self._nav_target = (float(location[0]), float(location[1]))
+        self._pickup_retries = 0
         self._actions.goto(location)
         self._notify_user(
             Performative.STATUS_UPDATE,
@@ -314,17 +359,36 @@ class RobotProtocol:
                   f"({location[0]:.1f}, {location[1]:.1f}); heading over to fetch it."))
 
     def _advance_navigating(self, t: int) -> None:
-        if t > self._nav_issued_t and self._actions.arrived():
-            self._actions.pickup(self._task.query)
-            self._notify_user(
-                Performative.STATUS_UPDATE,
-                text=(f"Picked up the {self._task.query.describe()}; "
-                      f"delivering to the {self._task.destination_name}."))
-            self._state = RobotState.OWNER_DELIVERING
+        if self._actions.failed():  # fell / unreachable object -> fail fast
+            self._fail_owner(self._actions.failure_reason(), t)
+            return
+        if not (t > self._nav_issued_t and self._actions.arrived()):
+            return
+        if self._actions.pickup(self._task.query):
+            self._begin_delivering(t)
+        elif self._pickup_retries < MAX_PICKUP_RETRIES:
+            # Grasp missed: re-approach the object once before giving up. Never
+            # transition to delivery (let alone completion) without a real hold.
+            self._pickup_retries += 1
             self._nav_issued_t = t
-            self._actions.deliver(self._task.destination_xy)
+            self._actions.goto(self._nav_target)
+        else:
+            self._fail_owner("could not pick up the object", t)
+
+    def _begin_delivering(self, t: int) -> None:
+        """Report the pickup and start carrying the object to the destination."""
+        self._notify_user(
+            Performative.STATUS_UPDATE,
+            text=(f"Picked up the {self._task.query.describe()}; "
+                  f"delivering to the {self._task.destination_name}."))
+        self._state = RobotState.OWNER_DELIVERING
+        self._nav_issued_t = t
+        self._actions.deliver(self._task.destination_xy)
 
     def _advance_delivering(self, t: int) -> None:
+        if self._actions.failed():  # fell mid-carry (object dropped) -> fail fast
+            self._fail_owner(self._actions.failure_reason(), t)
+            return
         if t > self._nav_issued_t and self._actions.arrived():
             self._notify_user(
                 Performative.TASK_COMPLETE,
@@ -346,6 +410,8 @@ class RobotProtocol:
         self._searchers = set()
         self._reserve = []
         self._peer_region = {}
+        self._nav_target = None
+        self._pickup_retries = 0
         self._state = RobotState.IDLE
 
     def _notify_user(self, performative: Performative, **payload: object) -> None:
@@ -375,25 +441,44 @@ class RobotProtocol:
                 self._actions.abort_search()
                 self._end_assist()
             return
-        if self.is_idle():
-            self._enter_assist(msg.sender, msg.payload["query"],
-                               msg.payload["region"], t)
+        if self.is_idle() and self._enter_assist(
+                msg.sender, msg.payload["query"], msg.payload["region"], t):
             self._bus.post(self.callsign, msg.sender, Performative.ACCEPT,
                            {"region": msg.payload["region"]}, in_reply_to=msg.msg_id)
         else:
+            reason = "busy" if not self.is_idle() else "region not coverable"
             self._bus.post(self.callsign, msg.sender, Performative.REJECT,
-                           {"reason": "busy"}, in_reply_to=msg.msg_id)
+                           {"reason": reason}, in_reply_to=msg.msg_id)
 
     def _enter_assist(self, commander: str, query: ObjectQuery, region: str,
-                      t: int) -> None:
-        """Enter the searching state for a commander (also a fleet/test entry point)."""
+                      t: int) -> bool:
+        """Enter the searching state for a commander (also a fleet/test entry point).
+
+        Returns:
+            True if a coverable patrol was started (state -> ``ASSIST_SEARCHING``);
+            False if the region has no reachable patrol, in which case the robot
+            stays idle so the caller can REJECT the command.
+        """
+        if not self._actions.start_search(query, region):
+            return False
         self._assist = _AssistCtx(commander, query, region, started_t=t)
         self._state = RobotState.ASSIST_SEARCHING
-        self._actions.start_search(query, region)
+        return True
 
     def _advance_searching(self, t: int) -> None:
         assist = self._assist
-        if assist is None or t <= assist.started_t:
+        if assist is None:
+            return
+        if self._actions.failed():
+            # We fell mid-search: tell the commander so it can reassign the region
+            # (or fail gracefully). A REJECT is the schema-legal peer->owner signal
+            # for "I can no longer cover this"; the owner's _on_reject re-plans it.
+            self._actions.abort_search()
+            self._bus.post(self.callsign, assist.commander, Performative.REJECT,
+                           {"reason": "searcher fell"})
+            self._end_assist()
+            return
+        if t <= assist.started_t:
             return  # give the search at least one step before the first look
         loc = self._actions.can_see(assist.query)
         if loc is not None:

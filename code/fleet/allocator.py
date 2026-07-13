@@ -21,6 +21,7 @@ the allocator's cost model is exactly the cost the winner will pay.
 from __future__ import annotations
 
 import dataclasses
+import math
 from typing import Dict, Optional, Sequence, Tuple
 
 from code.apps.warehouse_demo.planning import build_inflated_grid
@@ -45,6 +46,16 @@ class RobotPose:
     xy: XY
     yaw: float
     base_height: float
+
+
+def _pose_is_finite(pose: "RobotPose") -> bool:
+    """Whether every component of a pose is a finite number (safe to score).
+
+    A NaN/inf pose (e.g. a robot whose physics blew up) would raise inside the
+    grid/planner; such a candidate is treated as unallocatable instead.
+    """
+    return all(math.isfinite(v) for v in
+               (pose.xy[0], pose.xy[1], pose.yaw, pose.base_height))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -123,6 +134,8 @@ def _visible_object_xy(poses: Dict[str, RobotPose], scene_cfg: dict,
         oxy = (float(obj["x"]), float(obj["y"]))
         obj_z = max(0.12, float(obj.get("size", 0.2)) / 2.0)
         for pose in poses.values():
+            if not _pose_is_finite(pose):
+                continue  # a broken pose can't be scored and can't "see"
             if is_object_visible(pose.xy, pose.yaw, pose.base_height, oxy, walls,
                                  obj_z=obj_z, cfg=vis_cfg):
                 return oxy
@@ -156,6 +169,9 @@ def allocate(poses: Dict[str, RobotPose], scene_cfg: dict, query: ObjectQuery,
     targets: Dict[str, XY] = {}
     for cs in idle:
         pose = poses[cs]
+        if not _pose_is_finite(pose):
+            costs[cs] = float("inf")  # unallocatable: skip, never the argmin winner
+            continue
         if obj_xy is not None:
             targets[cs] = obj_xy
         else:

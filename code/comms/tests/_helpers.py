@@ -43,15 +43,26 @@ class FakeActions(RobotActions):
         find_after_polls: Number of search polls that return ``None`` before
             ``search_location`` is returned.
         arrives: What :meth:`arrived` returns (nav completes on the next poll).
+        nav_fails: What :meth:`failed` returns (models a fall / unreachable goal).
+        fail_reason: The reason string surfaced by :meth:`failure_reason`.
+        can_search: What :meth:`start_search` returns (False models a region with
+            no reachable patrol, so the searcher should REJECT).
+        can_pickup: What :meth:`pickup` returns (False models a missed grasp).
     """
 
     def __init__(self, *, static_location: Optional[XY] = None,
                  search_location: Optional[XY] = None,
-                 find_after_polls: int = 0, arrives: bool = True) -> None:
+                 find_after_polls: int = 0, arrives: bool = True,
+                 nav_fails: bool = False, fail_reason: str = "goal unreachable",
+                 can_search: bool = True, can_pickup: bool = True) -> None:
         self.static_location = static_location
         self.search_location = search_location
         self.find_after_polls = find_after_polls
         self._arrives = arrives
+        self.nav_fails = nav_fails
+        self.fail_reason = fail_reason
+        self.can_search = can_search
+        self.can_pickup = can_pickup
         self._searching = False
         self._poll_count = 0
         self.log: List[Tuple[str, object]] = []
@@ -71,17 +82,27 @@ class FakeActions(RobotActions):
     def arrived(self) -> bool:
         return self._arrives
 
-    def start_search(self, query, region: str) -> None:
+    def failed(self) -> bool:
+        return self.nav_fails
+
+    def failure_reason(self) -> str:
+        return self.fail_reason
+
+    def start_search(self, query, region: str) -> bool:
+        self.log.append(("start_search", region))
+        if not self.can_search:
+            return False
         self._searching = True
         self._poll_count = 0
-        self.log.append(("start_search", region))
+        return True
 
     def abort_search(self) -> None:
         self._searching = False
         self.log.append(("abort_search", None))
 
-    def pickup(self, query) -> None:
+    def pickup(self, query) -> bool:
         self.log.append(("pickup", None))
+        return self.can_pickup
 
     def deliver(self, destination_xy: XY) -> None:
         self.log.append(("deliver", destination_xy))

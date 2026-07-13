@@ -21,10 +21,11 @@ _CMAP = dict(COLORS)
 
 
 class _FakeUnit:
-    def __init__(self, xy, yaw, *, done=False) -> None:
+    def __init__(self, xy, yaw, *, done=False, fell=False) -> None:
         self._xy = xy
         self._yaw = yaw
         self.done = done
+        self.fell = fell
         self.goals = []
         self.plan_ok = True
         self.halted = False
@@ -50,28 +51,31 @@ class _FakeUnit:
 
 
 class _FakeSearch:
-    def __init__(self) -> None:
+    def __init__(self, ok=True) -> None:
         self.started = []
         self.stopped = 0
+        self._ok = ok
 
     def start(self, cfg, region) -> bool:
         self.started.append(region)
-        return True
+        return self._ok
 
     def stop(self) -> None:
         self.stopped += 1
 
 
 class _FakeCarry:
-    def __init__(self) -> None:
+    def __init__(self, ok=True) -> None:
         self.picked = []
         self.dest = []
         self._carried = set()
+        self._ok = ok
 
     def pickup(self, robot, index) -> bool:
         self.picked.append((robot, index))
-        self._carried.add(index)
-        return True
+        if self._ok:
+            self._carried.add(index)
+        return self._ok
 
     def set_destination(self, robot, xy) -> None:
         self.dest.append((robot, tuple(xy)))
@@ -166,6 +170,63 @@ class TestManipulation(unittest.TestCase):
         act.deliver((5.8, -1.0))
         self.assertEqual(carry.dest, [("Alpha", (5.8, -1.0))])
         self.assertEqual(unit.goals[-1], (5.8, -1.0))
+
+
+class TestFailureAndBooleans(unittest.TestCase):
+    """Robustness: failed()/failure_reason and the pickup/search return values."""
+
+    def test_failed_true_when_unit_fell(self) -> None:
+        cfg = _scene()
+        unit = _FakeUnit((-5.0, -5.0), 0.0, fell=True)
+        act = FleetRobotActions("Alpha", unit, cfg, _FakeSearch(), _FakeCarry())
+        self.assertTrue(act.failed())
+        self.assertEqual(act.failure_reason(), "robot fell")
+
+    def test_failed_true_when_goal_unreachable(self) -> None:
+        cfg = _scene()
+        unit = _FakeUnit((0.0, 0.0), 0.0)
+        unit.plan_ok = False  # both the direct plan and the retry fail
+        act = FleetRobotActions("Alpha", unit, cfg, _FakeSearch(), _FakeCarry())
+        act.goto((5.0, 0.0))
+        self.assertTrue(act.failed())
+        self.assertEqual(act.failure_reason(), "goal unreachable")
+
+    def test_failed_false_after_successful_plan(self) -> None:
+        cfg = _scene()
+        unit = _FakeUnit((-5.0, -5.0), 0.0)
+        act = FleetRobotActions("Alpha", unit, cfg, _FakeSearch(), _FakeCarry())
+        act.goto((1.0, 2.0))
+        self.assertFalse(act.failed())
+
+    def test_start_search_clears_stale_plan_failure(self) -> None:
+        # A prior failed navigation must not make a fresh searcher look "failed".
+        cfg = _scene()
+        unit = _FakeUnit((0.0, 0.0), 0.0)
+        unit.plan_ok = False
+        act = FleetRobotActions("Alpha", unit, cfg, _FakeSearch(), _FakeCarry())
+        act.goto((5.0, 0.0))
+        self.assertTrue(act.failed())
+        self.assertTrue(act.start_search(ObjectQuery("red", "cube"), "north"))
+        self.assertFalse(act.failed())  # stale plan-failure cleared
+
+    def test_start_search_returns_false_when_uncoverable(self) -> None:
+        cfg = _scene()
+        act = FleetRobotActions("Alpha", _FakeUnit((0, 0), 0), cfg,
+                                _FakeSearch(ok=False), _FakeCarry())
+        self.assertFalse(act.start_search(ObjectQuery("red", "cube"), "north"))
+
+    def test_pickup_returns_false_when_out_of_range(self) -> None:
+        cfg = _scene()
+        unit = _FakeUnit((-5.0, 0.5), 0.0)
+        act = FleetRobotActions("Alpha", unit, cfg, _FakeSearch(),
+                                _FakeCarry(ok=False))
+        self.assertFalse(act.pickup(ObjectQuery("red", "cube")))
+
+    def test_pickup_returns_false_when_no_match(self) -> None:
+        cfg = _scene()
+        unit = _FakeUnit((-5.0, 0.5), 0.0)
+        act = FleetRobotActions("Alpha", unit, cfg, _FakeSearch(), _FakeCarry())
+        self.assertFalse(act.pickup(ObjectQuery("magenta", "pyramid")))
 
 
 if __name__ == "__main__":

@@ -74,6 +74,30 @@ class TestCarry(unittest.TestCase):
         self.assertAlmostEqual(obj["x"], 5.8, places=3)
         self.assertAlmostEqual(obj["y"], -1.0, places=3)
 
+    def test_fallen_carrier_drops_object_in_place(self) -> None:
+        """A fallen carrier drops the object on the floor here, not at the pad."""
+        from code.fleet.robot_unit import RobotState
+
+        carry = self.mr.carry
+        unit = self.mr.fleet.units["Alpha"]
+        if not carry.carrying("Alpha"):
+            carry.pickup("Alpha", 0)
+        obj = self.mr.scene_cfg["objects"][0]
+        carry.set_destination("Alpha", (5.8, -1.0))  # a pad far from the bay
+        here_x, here_y = float(obj["x"]), float(obj["y"])
+        prev_state = unit.state
+        try:
+            unit.state = RobotState.FALLEN
+            carry.update()
+            # No longer carried, and dropped where it was (NOT at the pad).
+            self.assertFalse(carry.carrying("Alpha"))
+            self.assertFalse(carry.is_carried(0))
+            self.assertAlmostEqual(obj["x"], here_x, places=3)
+            self.assertAlmostEqual(obj["y"], here_y, places=3)
+            self.assertNotAlmostEqual(obj["x"], 5.8, places=1)
+        finally:
+            unit.state = prev_state
+
 
 if __name__ == "__main__":
     unittest.main()

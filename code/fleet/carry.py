@@ -173,13 +173,37 @@ class CarryManager:
         dest = self._dest.get(robot)
         if dest is None:
             dest = self._fleet.units[robot].xy
+        self._settle(index, robot, (float(dest[0]), float(dest[1])))
+        return index
+
+    def drop_here(self, robot: str) -> Optional[int]:
+        """Release the carried object flat on the floor at its *current* spot.
+
+        Used when the carrier can no longer deliver (it has fallen): the object
+        is dropped where it is right now rather than welded to the wrist forever,
+        so the owner's task can fail cleanly instead of hanging.
+
+        Args:
+            robot: The carrying robot.
+
+        Returns:
+            The released object index, or ``None`` if the robot carried nothing.
+        """
+        index = self._carry.pop(robot, None)
+        if index is None:
+            return None
+        here = (float(self._objects[index]["x"]), float(self._objects[index]["y"]))
+        self._settle(index, robot, here)
+        return index
+
+    def _settle(self, index: int, robot: str, xy: XY) -> None:
+        """Rest object ``index`` flat on the floor at ``xy`` and record it there."""
         size = float(self._objects[index].get("size", 0.2))
-        self._place(index, robot, (dest[0], dest[1], size / 2.0))
-        self._objects[index]["x"] = float(dest[0])
-        self._objects[index]["y"] = float(dest[1])
+        self._place(index, robot, (xy[0], xy[1], size / 2.0))
+        self._objects[index]["x"] = float(xy[0])
+        self._objects[index]["y"] = float(xy[1])
         self.released[robot] = index
         self._dest.pop(robot, None)
-        return index
 
     # -- per-step update --------------------------------------------------
     def update(self) -> None:
@@ -192,6 +216,11 @@ class CarryManager:
         for robot in list(self._carry):
             index = self._carry[robot]
             unit = self._fleet.units[robot]
+            if getattr(unit, "fell", False):
+                # A fallen carrier can never reach the pad: drop the object where
+                # it is (not welded to the wrist) so the fetch fails cleanly.
+                self.drop_here(robot)
+                continue
             dest = self._dest.get(robot)
             if dest is not None and self._at_destination(unit, dest):
                 self.release(robot)

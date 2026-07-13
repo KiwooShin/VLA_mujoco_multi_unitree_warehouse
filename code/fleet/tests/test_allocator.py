@@ -103,5 +103,28 @@ class TestAllocateEdges(unittest.TestCase):
         self.assertEqual(res.winner, "Bravo")
 
 
+class TestNonFinitePose(unittest.TestCase):
+    """Robustness: a NaN/inf robot pose is skipped, never scored or chosen."""
+
+    def test_nan_pose_skipped_finite_wins(self) -> None:
+        cfg = _cfg(6)
+        lay = hero_layout()
+        good = AL.RobotPose(lay.spawn_poses["Alpha"][:2],
+                            lay.spawn_poses["Alpha"][2], 0.74)
+        broken = AL.RobotPose((float("nan"), float("inf")), 0.0, 0.74)
+        poses = {"Alpha": good, "Bravo": broken}
+        res = AL.allocate(poses, cfg, ObjectQuery("red", "cube"),
+                          ["Alpha", "Bravo"])
+        self.assertEqual(res.winner, "Alpha")
+        self.assertEqual(res.costs["Bravo"], float("inf"))
+
+    def test_all_non_finite_yields_no_winner(self) -> None:
+        cfg = _cfg(6)
+        broken = AL.RobotPose((float("nan"), 0.0), 0.0, 0.74)
+        res = AL.allocate({"Alpha": broken}, cfg, ObjectQuery("red", "cube"),
+                          ["Alpha"])
+        self.assertIsNone(res.winner)
+
+
 if __name__ == "__main__":
     unittest.main()

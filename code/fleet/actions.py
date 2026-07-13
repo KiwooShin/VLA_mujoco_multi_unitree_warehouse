@@ -41,6 +41,8 @@ class _UnitLike(Protocol):
     def base_height(self) -> float: ...
     @property
     def done(self) -> bool: ...
+    @property
+    def fell(self) -> bool: ...
     def assign_goal(self, goal_xy: XY) -> bool: ...
     def halt(self) -> None: ...
 
@@ -125,21 +127,50 @@ class FleetRobotActions(RobotActions):
         """Whether the most recent nav target has been reached."""
         return bool(self._unit.done)
 
+    def failed(self) -> bool:
+        """Whether the robot can no longer make navigation progress.
+
+        True if the unit has fallen (a terminal state that never ``arrived``\\ s)
+        or its most recent goto/deliver plan was unreachable even after the
+        approach-point retry in :meth:`_plan_to`.
+        """
+        return bool(getattr(self._unit, "fell", False)) or self.last_plan_ok is False
+
+    def failure_reason(self) -> str:
+        """Short reason for the current :meth:`failed` state."""
+        if bool(getattr(self._unit, "fell", False)):
+            return "robot fell"
+        return "goal unreachable"
+
     # -- search -----------------------------------------------------------
-    def start_search(self, query: ObjectQuery, region: str) -> None:
-        """Begin patrolling a named region for the object."""
-        self._search.start(self._cfg, region)
+    def start_search(self, query: ObjectQuery, region: str) -> bool:
+        """Begin patrolling a named region for the object.
+
+        Returns:
+            True if the controller found a reachable patrol; False if the region
+            has no coverable waypoints (the protocol then declines the command).
+        """
+        # A fresh search assignment clears any stale plan-failure from a prior
+        # navigation so :meth:`failed` reflects only this searcher's own motion.
+        self.last_plan_ok = None
+        return bool(self._search.start(self._cfg, region))
 
     def abort_search(self) -> None:
         """Stop any in-progress search immediately."""
         self._search.stop()
 
     # -- manipulation -----------------------------------------------------
-    def pickup(self, query: ObjectQuery) -> None:
-        """Mock-pick the nearest matching object within reach."""
+    def pickup(self, query: ObjectQuery) -> bool:
+        """Mock-pick the nearest matching object within reach.
+
+        Returns:
+            True if the object is now held; False if no matching object exists or
+            the nearest one was out of the carry manager's pickup radius.
+        """
         idx = self._nearest_match(query)
-        if idx is not None:
-            self._carry.pickup(self.callsign, idx)
+        if idx is None:
+            return False
+        return bool(self._carry.pickup(self.callsign, idx))
 
     def deliver(self, destination_xy: XY) -> None:
         """Navigate to the destination while carrying the object."""

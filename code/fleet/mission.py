@@ -162,6 +162,10 @@ class MissionRunner:
         self.primary_owner: Optional[str] = None
         self.allocation: Optional[AllocationResult] = None
         self.trails: Dict[str, List[XY]] = {c: [] for c in self.callsigns}
+        # Fleet requests that arrived with no allocatable robot: retried each
+        # drain, queued-once notice sent, failed if still unassigned at budget end.
+        self._pending_fleet: List[TaskSpec] = []
+        self._fleet_queued_notified = False
 
     # -- clock ------------------------------------------------------------
     def _now(self) -> int:
@@ -169,8 +173,16 @@ class MissionRunner:
         return self._t
 
     # -- submission -------------------------------------------------------
+    def _mission_active(self) -> bool:
+        """Whether a submitted mission is still in flight (no terminal outcome yet)."""
+        return self._submitted > 0 and not self._terminal_seen()
+
     def submit(self, text: str) -> TaskSpec:
         """Parse and post a natural-language order onto the bus.
+
+        One :class:`MissionRunner` runs exactly one mission at a time. Submitting
+        a second order while the first is still in flight would silently clobber
+        the active task and owner attribution, so it is rejected.
 
         Args:
             text: The raw order (addressed to a callsign or the fleet).
@@ -180,7 +192,12 @@ class MissionRunner:
 
         Raises:
             ValueError: If no object colour/shape can be resolved from the order.
+            RuntimeError: If a mission is already in progress on this runner.
         """
+        if self._mission_active():
+            raise RuntimeError(
+                "a mission is already in progress; one MissionRunner handles one "
+                "mission at a time")
         addr = parse_addressed_instruction(text, self.callsigns)
         query = resolve_query(addr.body)
         if query is None:
@@ -199,23 +216,43 @@ class MissionRunner:
 
     # -- allocator --------------------------------------------------------
     def _run_allocator(self) -> None:
-        """Drain fleet requests, pick the path-shortest robot, assign + log."""
+        """Drain fleet requests, assign the path-shortest idle robot, or queue.
+
+        Newly drained requests join any still-unassigned ones; each is retried
+        every drain. A request with no allocatable robot is kept (not dropped) and
+        the user is told once that the order is queued.
+        """
         for msg in self.bus.drain(self.bus.allocator_inbox):
-            if msg.performative is not Performative.FLEET_REQUEST:
-                continue
-            task: TaskSpec = msg.payload["task"]
-            poses = {cs: RobotPose(u.xy, u.yaw, u.base_height)
-                     for cs, u in self.fleet.units.items()}
-            idle = [cs for cs in self.callsigns if self.protocols[cs].is_idle()]
-            result = allocate(poses, self.scene_cfg, task.query, idle,
-                              vis_cfg=self._vis, regions=self._regions)
-            self.allocation = result
-            self.bus.post("allocator", "user", Performative.STATUS_UPDATE,
-                          {"text": result.describe()})
-            if result.winner is not None:
-                self.primary_owner = result.winner
-                self.bus.post("allocator", result.winner,
-                              Performative.REQUEST_TASK, {"task": task})
+            if msg.performative is Performative.FLEET_REQUEST:
+                self._pending_fleet.append(msg.payload["task"])
+        if not self._pending_fleet:
+            return
+        still_pending: List[TaskSpec] = []
+        for task in self._pending_fleet:
+            if not self._try_allocate(task):
+                still_pending.append(task)
+        self._pending_fleet = still_pending
+
+    def _try_allocate(self, task: TaskSpec) -> bool:
+        """Attempt to assign one task to an idle robot; return whether it stuck."""
+        poses = {cs: RobotPose(u.xy, u.yaw, u.base_height)
+                 for cs, u in self.fleet.units.items()}
+        idle = [cs for cs in self.callsigns if self.protocols[cs].is_idle()]
+        result = allocate(poses, self.scene_cfg, task.query, idle,
+                          vis_cfg=self._vis, regions=self._regions)
+        if result.winner is None:
+            if not self._fleet_queued_notified:
+                self._fleet_queued_notified = True
+                self.bus.post("allocator", "user", Performative.STATUS_UPDATE,
+                              {"text": "all robots busy - order queued"})
+            return False
+        self.allocation = result
+        self.primary_owner = result.winner
+        self.bus.post("allocator", "user", Performative.STATUS_UPDATE,
+                      {"text": result.describe()})
+        self.bus.post("allocator", result.winner,
+                      Performative.REQUEST_TASK, {"task": task})
+        return True
 
     # -- main loop --------------------------------------------------------
     def run(self, max_steps: int,
@@ -247,11 +284,19 @@ class MissionRunner:
                 on_step(self, t)
             if self._is_done():
                 break
+        # Budget exhausted with a fleet order that never found a free robot:
+        # fail it explicitly so the user gets a terminal answer, not silence.
+        if self._pending_fleet and not self._terminal_seen():
+            self.bus.post("allocator", "user", Performative.TASK_FAILED,
+                          {"reason": "no robot became available to take the order"})
+            self._pending_fleet = []
         return self._result()
 
     def _is_done(self) -> bool:
         """True once a terminal result has reached the user and all robots idle."""
         if self._submitted == 0 or not self._terminal_seen():
+            return False
+        if self._pending_fleet:
             return False
         if self.bus.pending(self.bus.allocator_inbox) > 0:
             return False

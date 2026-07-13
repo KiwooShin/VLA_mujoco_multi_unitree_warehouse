@@ -52,6 +52,17 @@ class FakeActions(RobotActions):
             close-range perception fix before a pickup re-approach). ``None`` (the
             default) models the oracle path — no fresh fix — leaving the retry's
             goal unchanged.
+        confirm_range: What :meth:`confirm_report_range_m` returns — the
+            CONFIRM-THEN-REPORT reliable-report range. ``None`` (default) disables
+            the discipline (the oracle path: a sighting is reported immediately).
+        approach_location: What :meth:`can_see` returns once an approach has begun
+            (i.e. after the first :meth:`goto`) while not searching — models the
+            fresh, closer estimate a robot gets after walking toward a long-range
+            sighting. ``None`` -> :meth:`can_see` keeps returning ``static_location``.
+        approach_after_polls: Number of approaching :meth:`can_see` polls that
+            still return ``static_location`` (the object still far, mid-approach)
+            before ``approach_location`` kicks in — models the walk-in taking a
+            few steps to reach a reliable close-range look.
     """
 
     def __init__(self, *, static_location: Optional[XY] = None,
@@ -60,6 +71,9 @@ class FakeActions(RobotActions):
                  nav_fails: bool = False, fail_reason: str = "goal unreachable",
                  can_search: bool = True, can_pickup: bool = True,
                  reconfirm_location: Optional[XY] = None,
+                 confirm_range: Optional[float] = None,
+                 approach_location: Optional[XY] = None,
+                 approach_after_polls: int = 0,
                  pose: XY = (0.0, 0.0), room: str = "the area") -> None:
         self.static_location = static_location
         self.search_location = search_location
@@ -70,10 +84,15 @@ class FakeActions(RobotActions):
         self.can_search = can_search
         self.can_pickup = can_pickup
         self.reconfirm_location = reconfirm_location
+        self.confirm_range = confirm_range
+        self.approach_location = approach_location
+        self.approach_after_polls = approach_after_polls
         self.pose = pose            # this robot's own (exactly known) pose (F3)
         self.room = room            # this robot's current region/room name (F3)
         self._searching = False
         self._poll_count = 0
+        self._approaching = False   # latched once a goto (approach) has begun
+        self._approach_polls = 0
         self.log: List[Tuple[str, object]] = []
 
     def can_see(self, query) -> Optional[XY]:
@@ -83,7 +102,15 @@ class FakeActions(RobotActions):
                     and self._poll_count > self.find_after_polls):
                 return self.search_location
             return None
+        if self._approaching and self.approach_location is not None:
+            self._approach_polls += 1
+            if self._approach_polls > self.approach_after_polls:
+                return self.approach_location
+            return self.static_location   # still far, mid-approach
         return self.static_location
+
+    def confirm_report_range_m(self) -> Optional[float]:
+        return self.confirm_range
 
     def reconfirm_target(self, query) -> Optional[XY]:
         self.log.append(("reconfirm_target", self.reconfirm_location))
@@ -93,6 +120,7 @@ class FakeActions(RobotActions):
         return (self.pose, self.room)
 
     def goto(self, xy: XY) -> None:
+        self._approaching = True
         self.log.append(("goto", xy))
 
     def arrived(self) -> bool:

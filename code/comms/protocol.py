@@ -63,6 +63,30 @@ GOAL_REFINE_INTERVAL: int = 50          # K: min steps between refinements
 GOAL_REFINE_MAX_DELTA_M: float = 2.5    # same-object sanity (reject far jumps)
 GOAL_REFINE_MIN_DELTA_M: float = 0.3    # ignore sub-threshold nudges
 GOAL_REFINE_MIN_RANGE_M: float = 0.6    # only refine while > pickup radius away
+# Wider same-object refinement gate applied when the fetch goal came from an
+# *approximate* (long-range) report — see CONFIRM-THEN-REPORT below. A report the
+# reporter itself flagged ``approx`` was made without a close-range confirm, so
+# the owner's approach may need to correct it by more than a normal same-object
+# nudge; the gate is widened (but still bounded) so a genuine close-range fix
+# during the approach can still land.
+GOAL_REFINE_MAX_DELTA_APPROX_M: float = 4.0
+
+# CONFIRM-THEN-REPORT (gen_eval rooms seed-6 long-range mis-report). A learned
+# detector's world-xy error grows with range: the confirmer's bearing gate admits
+# a detection up to ~22 deg off, whose world error scales as range*sin(22 deg)
+# (~0.375*range), so a sighting first made at 6 m can be ~2 m off even though it
+# passed the gate. Reporting that raw long-range estimate strands the owner
+# outside pickup range (the approach never re-frames the true object). So in
+# groundnet mode a FIRST sighting beyond the detector's reliable-report range
+# (:meth:`RobotActions.confirm_report_range_m`, ``None`` in oracle mode -> the
+# discipline is off and behaviour is byte-identical) is NOT reported yet: the
+# searcher/owner walks toward the sighting, re-confirms at close range, THEN
+# reports/commits the refined estimate. Bounded to one approach leg — reaching a
+# standoff without a close confirm, or losing sight of the object for
+# ``CONFIRM_MAX_NO_SIGHT_STEPS``, falls back to the long-range estimate flagged
+# ``approx`` (which the owner then refines against with the wider gate above).
+CONFIRM_STANDOFF_M: float = 3.0          # plan this far SHORT of the estimate
+CONFIRM_MAX_NO_SIGHT_STEPS: int = 40     # lost-sight grace before approx fallback
 
 # Default region labels handed to searchers, partitioning the hall. These MUST
 # be regions that :func:`code.fleet.search.region_bounds` understands, otherwise
@@ -116,6 +140,20 @@ class RobotActions(abc.ABC):
         current goal), which is exactly the behaviour with a perfect oracle; the
         fleet bridge overrides it to re-run the learned detector in groundnet
         mode only, leaving the oracle path byte-identical."""
+        return None
+
+    def confirm_report_range_m(self) -> Optional[float]:
+        """Range beyond which a FIRST sighting must be close-confirmed (CONFIRM-THEN-REPORT).
+
+        When a searcher (or an owner on its own first sighting) sees the object
+        farther than this, the raw detector estimate is unreliable enough that
+        reporting/committing it immediately can strand the fetcher outside pickup
+        range; the protocol instead walks toward the sighting and re-confirms at
+        close range before reporting. The base implementation returns ``None`` —
+        the discipline is disabled and a sighting is reported the instant it is
+        seen, which is exactly (and byte-identically) the perfect-oracle path. The
+        fleet bridge overrides it to return the detector's measured reliable range
+        only in groundnet mode."""
         return None
 
     def report_origin(self) -> Tuple[XY, str]:
@@ -189,6 +227,15 @@ class _AssistCtx:
     query: ObjectQuery
     region: str
     started_t: int
+    # CONFIRM-THEN-REPORT approach sub-state (groundnet long-range first sighting).
+    # While ``confirming`` the searcher is walking toward a standoff to re-confirm
+    # the sighting at close range before it sends REPORT_FOUND; ``best_xy`` holds
+    # the freshest/closest estimate seen so far (the approx fallback), and the two
+    # timestamps bound the single approach leg.
+    confirming: bool = False
+    best_xy: Optional[XY] = None
+    approach_started_t: int = 0
+    last_seen_t: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -240,8 +287,17 @@ class RobotProtocol:
         self._search_deadline = 0
         self._nav_issued_t = 0
         self._nav_target: Optional[XY] = None  # object location for pickup re-approach
+        self._nav_target_approx = False  # goal came from an approx (long-range) report -> wider refine gate
         self._pickup_retries = 0
         self._last_refine_t = 0  # last close-range goal refinement (D-14)
+        # Owner own-sighting CONFIRM-THEN-REPORT approach: while ``_own_confirm``
+        # the owner is walking to a standoff to re-confirm its OWN long-range
+        # first sighting before it commits the fetch goal (state stays
+        # OWNER_NAVIGATING — "fetching" — but no located target is published yet).
+        self._own_confirm = False
+        self._own_confirm_best: Optional[XY] = None
+        self._own_confirm_started_t = 0
+        self._own_confirm_last_seen_t = 0
 
         # Helper-role bookkeeping.
         self._assist: Optional[_AssistCtx] = None
@@ -298,7 +354,9 @@ class RobotProtocol:
         gx, gy = self._nav_target
         nx, ny = float(new_xy[0]), float(new_xy[1])
         delta = math.hypot(nx - gx, ny - gy)
-        if not (GOAL_REFINE_MIN_DELTA_M < delta <= GOAL_REFINE_MAX_DELTA_M):
+        max_delta = (GOAL_REFINE_MAX_DELTA_APPROX_M if self._nav_target_approx
+                     else GOAL_REFINE_MAX_DELTA_M)
+        if not (GOAL_REFINE_MIN_DELTA_M < delta <= max_delta):
             return False
         if math.hypot(gx - float(robot_xy[0]), gy - float(robot_xy[1])) <= GOAL_REFINE_MIN_RANGE_M:
             return False  # already within pickup range of the goal — don't nudge
@@ -350,10 +408,24 @@ class RobotProtocol:
         self.last_result = None
         loc = self._actions.can_see(self._task.query)
         if loc is not None:
-            self._begin_navigation(loc, t)
+            self._begin_owner_leg(loc, t)
         else:
             self._query_queue = list(self._peers)
             self._start_next_query(t)
+
+    def _begin_owner_leg(self, loc: XY, t: int) -> None:
+        """Start the owner's fetch from its OWN first sighting (CONFIRM-THEN-REPORT).
+
+        A close (or oracle-mode) sighting is committed immediately as the fetch
+        goal; a groundnet long-range sighting is instead confirmed by walking to a
+        standoff first (:meth:`_enter_owner_confirm`), so an unreliable long-range
+        estimate never becomes the committed goal.
+        """
+        reliable = self._actions.confirm_report_range_m()
+        if reliable is not None and self._sighting_range(loc) > reliable:
+            self._enter_owner_confirm(loc, t)
+        else:
+            self._begin_navigation(loc, t)
 
     def _start_next_query(self, t: int) -> None:
         """Query the next peer, or delegate a search if all peers are exhausted."""
@@ -454,8 +526,11 @@ class RobotProtocol:
         reporter = msg.sender
         self._cancel_active_searchers(exclude=reporter)
         # F3: reconstruct the absolute object position from the searcher's
-        # relative report (reporter_pose + rel_offset).
-        self._begin_navigation(reconstruct_location(msg.payload), t)
+        # relative report (reporter_pose + rel_offset). A report the searcher
+        # flagged ``approx`` (it could not close-confirm) gets the wider
+        # refinement gate so the owner's approach can correct it.
+        approx = bool(msg.payload.get("approx", False))
+        self._begin_navigation(reconstruct_location(msg.payload), t, approx=approx)
 
     def _cancel_active_searchers(self, exclude: Optional[str] = None) -> None:
         """Call off every active/pending searcher (in fixed peer order for determinism)."""
@@ -465,10 +540,14 @@ class RobotProtocol:
                 self._command_cancel(peer)
 
     # -- owner role: fetch & deliver --------------------------------------
-    def _begin_navigation(self, location: XY, t: int) -> None:
+    def _begin_navigation(self, location: XY, t: int, *,
+                          approx: bool = False) -> None:
         self._state = RobotState.OWNER_NAVIGATING
+        self._own_confirm = False  # committing to a real goal ends any confirm leg
+        self._own_confirm_best = None
         self._nav_issued_t = t
         self._nav_target = (float(location[0]), float(location[1]))
+        self._nav_target_approx = bool(approx)
         self._pickup_retries = 0
         self._last_refine_t = t
         self._actions.goto(location)
@@ -478,6 +557,9 @@ class RobotProtocol:
                   f"({location[0]:.1f}, {location[1]:.1f}); heading over to fetch it."))
 
     def _advance_navigating(self, t: int) -> None:
+        if self._own_confirm:
+            self._advance_owner_confirm(t)
+            return
         if self._actions.failed():  # fell / unreachable object -> fail fast
             self._fail_owner(self._actions.failure_reason(), t)
             return
@@ -495,13 +577,67 @@ class RobotProtocol:
             fresh = self._actions.reconfirm_target(self._task.query)
             if fresh is not None and self._nav_target is not None:
                 fx, fy = float(fresh[0]), float(fresh[1])
+                max_delta = (GOAL_REFINE_MAX_DELTA_APPROX_M if self._nav_target_approx
+                             else GOAL_REFINE_MAX_DELTA_M)
                 if math.hypot(fx - self._nav_target[0],
-                              fy - self._nav_target[1]) <= GOAL_REFINE_MAX_DELTA_M:
+                              fy - self._nav_target[1]) <= max_delta:
                     self._nav_target = (fx, fy)
             self._nav_issued_t = t
             self._actions.goto(self._nav_target)
         else:
             self._fail_owner("could not pick up the object", t)
+
+    # -- owner role: confirm-then-commit own long-range sighting -----------
+    def _enter_owner_confirm(self, loc: XY, t: int) -> None:
+        """Walk to a standoff to re-confirm the owner's OWN long-range sighting.
+
+        The owner enters ``OWNER_NAVIGATING`` (it IS heading toward the object)
+        but with ``_own_confirm`` set and no committed ``_nav_target`` yet, so no
+        "found it" milestone is announced and no target ring is published until
+        the close-range confirm lands. It plans to a standoff ~``CONFIRM_STANDOFF_M``
+        short of the estimate (never onto the unreliable point).
+        """
+        self._state = RobotState.OWNER_NAVIGATING
+        self._own_confirm = True
+        self._own_confirm_best = (float(loc[0]), float(loc[1]))
+        self._own_confirm_started_t = t
+        self._own_confirm_last_seen_t = t
+        self._nav_target = None
+        self._nav_target_approx = False
+        self._nav_issued_t = t
+        self._actions.goto(self._standoff_toward(loc, CONFIRM_STANDOFF_M))
+
+    def _advance_owner_confirm(self, t: int) -> None:
+        """Advance the owner's confirm approach; commit the goal once resolved."""
+        if self._actions.failed():
+            # Can't complete the approach -> commit to the best estimate we have,
+            # flagged approx so the fetch approach refines it with the wider gate.
+            self._commit_owner_confirm(self._own_confirm_best, t, approx=True)
+            return
+        loc = self._actions.can_see(self._task.query)
+        if loc is not None:
+            self._own_confirm_best = (float(loc[0]), float(loc[1]))
+            self._own_confirm_last_seen_t = t
+            reliable = self._actions.confirm_report_range_m()
+            if reliable is None or self._sighting_range(loc) <= reliable:
+                # Close-range confirm: commit the refined estimate and fetch it.
+                self._commit_owner_confirm(loc, t, approx=False)
+                return
+        if t > self._own_confirm_started_t and self._actions.arrived():
+            self._commit_owner_confirm(self._own_confirm_best, t, approx=True)
+            return
+        if t - self._own_confirm_last_seen_t >= CONFIRM_MAX_NO_SIGHT_STEPS:
+            self._commit_owner_confirm(self._own_confirm_best, t, approx=True)
+
+    def _commit_owner_confirm(self, loc: Optional[XY], t: int, *,
+                              approx: bool) -> None:
+        """Finish the owner's confirm leg by committing ``loc`` as the fetch goal."""
+        target = loc if loc is not None else self._nav_target
+        self._own_confirm = False
+        if target is None:  # nothing ever sighted (defensive) -> fail the fetch
+            self._fail_owner("lost sight of the object before confirming", t)
+            return
+        self._begin_navigation(target, t, approx=approx)
 
     def _begin_delivering(self, t: int) -> None:
         """Report the pickup and start carrying the object to the destination."""
@@ -539,6 +675,9 @@ class RobotProtocol:
         self._reserve = []
         self._peer_region = {}
         self._nav_target = None
+        self._nav_target_approx = False
+        self._own_confirm = False
+        self._own_confirm_best = None
         self._pickup_retries = 0
         self._state = RobotState.IDLE
 
@@ -609,6 +748,9 @@ class RobotProtocol:
         assist = self._assist
         if assist is None:
             return
+        if assist.confirming:
+            self._advance_searcher_confirm(t)
+            return
         if self._actions.failed():
             # We fell mid-search: tell the commander so it can reassign the region
             # (or fail gracefully). A REJECT is the schema-legal peer->owner signal
@@ -622,12 +764,102 @@ class RobotProtocol:
             return  # give the search at least one step before the first look
         loc = self._actions.can_see(assist.query)
         if loc is not None:
-            # Need-to-know: the find goes to the commander ONLY, then we stop.
-            # F3: report the object relative to my own known pose + room.
-            self._bus.post(self.callsign, assist.commander, Performative.REPORT_FOUND,
-                           self._relative_report({"object": assist.query}, loc))
+            reliable = self._actions.confirm_report_range_m()
+            if reliable is not None and self._sighting_range(loc) > reliable:
+                # CONFIRM-THEN-REPORT: a groundnet long-range first sighting is
+                # unreliable — walk toward it and re-confirm before reporting.
+                self._enter_searcher_confirm(assist, loc, t)
+                return
+            # Close (or oracle-mode) sighting -> report the find now. Need-to-know:
+            # the find goes to the commander ONLY, then we stop.
+            self._post_report_found(assist.commander, assist.query, loc,
+                                    approx=False)
             self._actions.abort_search()
             self._end_assist()
+
+    def _enter_searcher_confirm(self, assist: _AssistCtx, loc: XY, t: int) -> None:
+        """Begin the searcher's one approach leg to close-confirm a long-range find.
+
+        Stays in ``ASSIST_SEARCHING`` (a flag on the assist context, not a new
+        performative — the transcript stays sensible, the find just arrives a few
+        seconds later). Stops the region patrol and plans to a standoff
+        ~``CONFIRM_STANDOFF_M`` short of the estimate.
+        """
+        assist.confirming = True
+        assist.best_xy = (float(loc[0]), float(loc[1]))
+        assist.approach_started_t = t
+        assist.last_seen_t = t
+        self._actions.abort_search()
+        self._actions.goto(self._standoff_toward(loc, CONFIRM_STANDOFF_M))
+
+    def _advance_searcher_confirm(self, t: int) -> None:
+        """Advance the searcher's confirm approach; report once resolved."""
+        assist = self._assist
+        if assist is None:
+            return
+        if self._actions.failed():
+            # Can't complete the approach -> hand off the best long-range estimate
+            # flagged approx (we DID sight it; a wider owner gate recovers it).
+            self._finish_searcher_confirm(assist, assist.best_xy, approx=True)
+            return
+        loc = self._actions.can_see(assist.query)
+        if loc is not None:
+            assist.best_xy = (float(loc[0]), float(loc[1]))
+            assist.last_seen_t = t
+            reliable = self._actions.confirm_report_range_m()
+            if reliable is None or self._sighting_range(loc) <= reliable:
+                self._finish_searcher_confirm(assist, loc, approx=False)
+                return
+        if t > assist.approach_started_t and self._actions.arrived():
+            # Reached the standoff without a close confirm -> report approx.
+            self._finish_searcher_confirm(assist, assist.best_xy, approx=True)
+            return
+        if t - assist.last_seen_t >= CONFIRM_MAX_NO_SIGHT_STEPS:
+            # Lost sight of the object during the approach -> report approx.
+            self._finish_searcher_confirm(assist, assist.best_xy, approx=True)
+
+    def _finish_searcher_confirm(self, assist: _AssistCtx, loc: Optional[XY],
+                                 approx: bool) -> None:
+        """Send the (possibly approx) REPORT_FOUND and end the assist."""
+        target = loc if loc is not None else assist.best_xy
+        if target is not None:
+            self._post_report_found(assist.commander, assist.query, target,
+                                    approx=approx)
+        self._actions.abort_search()
+        self._end_assist()
+
+    def _post_report_found(self, commander: str, query: ObjectQuery, loc: XY,
+                           *, approx: bool) -> None:
+        """Post a REPORT_FOUND to the commander (adds ``approx`` only when true).
+
+        A confirmed / oracle-mode report carries the exact historical payload (no
+        ``approx`` key) so those messages stay byte-identical; only a long-range
+        fallback tags ``approx=True`` for the owner's wider refinement gate.
+        """
+        base: Dict[str, object] = {"object": query}
+        if approx:
+            base["approx"] = True
+        self._bus.post(self.callsign, commander, Performative.REPORT_FOUND,
+                       self._relative_report(base, loc))
+
+    def _sighting_range(self, loc: XY) -> float:
+        """Straight-line range (m) from my own known pose to a sighting estimate."""
+        (rx, ry), _room = self._actions.report_origin()
+        return math.hypot(float(loc[0]) - rx, float(loc[1]) - ry)
+
+    def _standoff_toward(self, loc: XY, standoff_m: float) -> XY:
+        """A point ``standoff_m`` short of ``loc`` along my heading toward it.
+
+        Keeps the approach pointed at the sighting (so it stays framed) while
+        never planning onto the unreliable long-range estimate itself.
+        """
+        (rx, ry), _room = self._actions.report_origin()
+        dx, dy = float(loc[0]) - rx, float(loc[1]) - ry
+        d = math.hypot(dx, dy)
+        if d <= standoff_m:
+            return (rx, ry)
+        k = (d - standoff_m) / d
+        return (rx + dx * k, ry + dy * k)
 
     def _end_assist(self) -> None:
         self._assist = None

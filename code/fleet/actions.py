@@ -73,6 +73,7 @@ class FleetRobotActions(RobotActions):
                  vis_cfg: Optional[VisibilityConfig] = None,
                  perception: Optional[object] = None,
                  confirm_range_m: float = 7.0,
+                 reliable_report_range_m: Optional[float] = None,
                  layout: Optional[WarehouseLayout] = None) -> None:
         """Bind the bridge to one robot's world objects.
 
@@ -92,6 +93,11 @@ class FleetRobotActions(RobotActions):
                 ``None`` (default), ``can_see`` is the pure geometric oracle.
             confirm_range_m: Max range (m) at which to run the detector confirmer
                 (mirrors ``perception_bridge.CONFIRM_RANGE_M``).
+            reliable_report_range_m: CONFIRM-THEN-REPORT reliable-report range (m)
+                surfaced to the protocol via :meth:`confirm_report_range_m`. When
+                ``None`` (oracle mode / no discipline) a sighting is reported the
+                instant it is seen (byte-identical). The fleet passes
+                ``perception_bridge.RELIABLE_REPORT_RANGE_M`` in groundnet mode.
             layout: The active warehouse layout, so :meth:`report_origin` can name
                 the room this robot is currently standing in (F3). ``None`` falls
                 back to the region-less "the area".
@@ -104,6 +110,9 @@ class FleetRobotActions(RobotActions):
         self._vis = vis_cfg or VisibilityConfig()
         self._perception = perception
         self._confirm_range_m = float(confirm_range_m)
+        self._reliable_report_range_m = (
+            float(reliable_report_range_m)
+            if reliable_report_range_m is not None else None)
         self._layout = layout
         self.last_plan_ok: Optional[bool] = None
         # Provenance of the most recent successful can_see (for evals/video):
@@ -151,6 +160,18 @@ class FleetRobotActions(RobotActions):
         if self._perception is None:
             return None
         return self.can_see(query)
+
+    def confirm_report_range_m(self) -> Optional[float]:
+        """Reliable-report range (m) for CONFIRM-THEN-REPORT (groundnet only).
+
+        Returns the configured reliable range only when the learned detector is
+        active; ``None`` in oracle mode (no perception), which disables the
+        confirm-then-report discipline so ``can_see`` sightings are reported
+        immediately — byte-identical to the historical oracle path.
+        """
+        if self._perception is None:
+            return None
+        return self._reliable_report_range_m
 
     def _confirm(self, query: ObjectQuery, oracle_xy: XY) -> XY:
         """Confirm an oracle-visible sighting with the detector (groundnet mode).

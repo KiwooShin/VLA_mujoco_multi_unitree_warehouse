@@ -250,12 +250,19 @@ def run_gen_eval(family: str, layout_seeds: int, mission_seeds: int,
                  out_dir: str, max_steps: int, stacks: Sequence[str],
                  base_seed: int = 0, vla_ckpt: Optional[str] = None,
                  vla_device: Optional[str] = None,
-                 fail_threshold: float = 0.83) -> dict:
+                 fail_threshold: float = 0.83,
+                 only_layout_seed: Optional[int] = None) -> dict:
     """Sample N layouts, run every mission on every stack, tabulate + persist.
 
     Returns the aggregate summary dict; also writes per-layout/per-stack JSON,
     an all-missions JSONL, the aggregate ``summary.json``, and a BEV PNG for any
     (layout, stack) whose A-C success rate falls below ``fail_threshold``.
+
+    ``only_layout_seed`` restricts the run to exactly that one layout seed (each
+    layout is sampled deterministically from its integer seed and every mission
+    is run on a fresh :class:`~code.fleet.mission.MissionRunner`, so a single-seed
+    run reproduces that seed's slice of a full run byte-for-byte) — a quick,
+    deterministic repro handle for a specific failing layout.
     """
     os.makedirs(out_dir, exist_ok=True)
     teachers = {cs: WBCTeacher(use_gpu=True) for cs in CALLSIGNS}
@@ -266,8 +273,9 @@ def run_gen_eval(family: str, layout_seeds: int, mission_seeds: int,
     t0 = time.time()
     total_missions = 0
 
-    for k in range(layout_seeds):
-        seed = base_seed + k
+    seeds = ([only_layout_seed] if only_layout_seed is not None
+             else [base_seed + k for k in range(layout_seeds)])
+    for seed in seeds:
         layout = sample_family_layout(family, seed)
         plan = build_plan(family, layout, mission_seeds)
         bev_path = os.path.join(out_dir, f"layout_seed{seed:03d}.png")
@@ -387,6 +395,9 @@ def main(argv: Optional[List[str]] = None) -> None:
                     help="seeds per A/B/C class per layout (3*seeds + 3 D)")
     ap.add_argument("--base-seed", type=int, default=0,
                     help="layout RNG base; layout k uses base+k")
+    ap.add_argument("--only-layout-seed", type=int, default=None,
+                    help="run exactly this one layout seed (deterministic single-"
+                         "seed repro; overrides --layout-seeds/--base-seed range)")
     ap.add_argument("--stacks", default="both",
                     help="'both' (default), 'learned', 'baseline', or a comma list")
     ap.add_argument("--out", type=str, default=None,
@@ -406,7 +417,8 @@ def main(argv: Optional[List[str]] = None) -> None:
     out = args.out or os.path.join(_DEFAULT_OUT, args.layout_family)
     run_gen_eval(args.layout_family, args.layout_seeds, args.mission_seeds,
                  out, args.max_steps, stacks, base_seed=args.base_seed,
-                 vla_ckpt=args.ckpt, vla_device=args.device)
+                 vla_ckpt=args.ckpt, vla_device=args.device,
+                 only_layout_seed=args.only_layout_seed)
 
 
 if __name__ == "__main__":

@@ -206,6 +206,12 @@ class MissionRunner:
         # Rooms-mode search delegation assigns each peer its nearest unsearched
         # room by A* distance; hero thirds keep the in-order default (None).
         assigner = self._room_region_assigner if self._rooms else None
+        # CONFIRM-THEN-REPORT reliable range: only handed to the bridge in
+        # groundnet mode (oracle keeps it None -> discipline off, byte-identical).
+        reliable_range: Optional[float] = None
+        if perception_mode == "groundnet":
+            from code.fleet.perception_bridge import RELIABLE_REPORT_RANGE_M
+            reliable_range = RELIABLE_REPORT_RANGE_M
         self._search: Dict[str, SearchController] = {}
         self.actions: Dict[str, FleetRobotActions] = {}
         self.protocols: Dict[str, RobotProtocol] = {}
@@ -215,6 +221,7 @@ class MissionRunner:
             act = FleetRobotActions(cs, self.fleet.units[cs], self.scene_cfg,
                                     search_ctrl, self.carry, vis_cfg=self._vis,
                                     perception=self.perceptions.get(cs),
+                                    reliable_report_range_m=reliable_range,
                                     layout=self.layout)
             self._search[cs] = search_ctrl
             self.actions[cs] = act

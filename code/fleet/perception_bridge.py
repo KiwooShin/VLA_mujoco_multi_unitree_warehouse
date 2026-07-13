@@ -75,6 +75,22 @@ CONFIRM_RANGE_M: float = 7.0
 # object can be oracle-visible yet outside the grounding frame; the confirmer
 # only runs the detector within THIS narrower, honest field of view.
 GROUNDING_HALF_FOV_DEG: float = 28.0
+# CONFIRM-THEN-REPORT reliable-report range (m). A FIRST sighting made farther
+# than this is close-confirmed before it is reported/committed (see
+# code.comms.protocol). Justification from the measured detector characterization:
+# perception_eval rings cameras at (2.5, 3.5, 4.5, 5.5) m and the warehouse
+# fine-tune's world-xy error stays tiny across that *centred* envelope
+# (eval/perception/ft: xy_err p90 0.037 m, max 0.068 m). But the mission confirmer
+# admits a detection whose bearing is up to CONFIRM_BEARING_GATE_DEG (22 deg) off,
+# and a bearing error becomes a world-xy error of range*sin(22 deg) ~= 0.375*range
+# via the lever arm — so a gate-passing sighting at 6 m can be ~2.2 m off (exactly
+# the rooms seed-6 outlier). Setting the reliable range where that worst-case
+# admitted error stays inside the owner's same-object refinement budget
+# (GOAL_REFINE_MAX_DELTA_M = 2.5 m: 0.375*4.5 ~= 1.7 m) — and comfortably within
+# the 5.5 m characterized envelope — gives 4.5 m: nearer sightings are reported
+# straight away, farther ones are walked-in and re-confirmed first.
+RELIABLE_REPORT_RANGE_M: float = 4.5
+
 # Minimum detector confidence for a fresh approach confirmation to STEER the
 # owner's fetch goal (D-14 close-range goal refinement). Higher than the bare
 # confirmation floor (CONFIRM_TAU) because a refinement re-plans the navigation

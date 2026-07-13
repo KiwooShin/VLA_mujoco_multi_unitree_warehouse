@@ -167,5 +167,83 @@ class TestPickupRetryFreshConfirm(unittest.TestCase):
         self.assertEqual(act.calls("goto"), [GOAL, GOAL])  # stale-far ignored
 
 
+class _PlanFake(FakeActions):
+    """A FakeActions whose ``goto`` to a *blocked* point makes ``failed()`` True.
+
+    Models the real bridge, where ``goto`` sets ``last_plan_ok`` and ``failed()``
+    is True when the most recent plan was unreachable. ``blocked`` is a predicate
+    over the goal ``(x, y)`` (an unplannable estimate). Used to exercise the
+    resilient re-plan paths: a fresh perception estimate that lands somewhere the
+    planner can't route to must NOT hard-fail the fetch — the owner keeps the
+    previous reachable goal (or, for confirm-commit, a reachable standoff).
+    """
+
+    def __init__(self, *, blocked, **kw) -> None:
+        super().__init__(**kw)
+        self._blocked = blocked
+        self._plan_ok = True
+
+    def goto(self, xy) -> None:
+        super().goto(xy)
+        self._plan_ok = not self._blocked(xy)
+
+    def failed(self) -> bool:
+        return self.nav_fails or not self._plan_ok
+
+
+def _is(pt):
+    return lambda xy: abs(xy[0] - pt[0]) < 1e-6 and abs(xy[1] - pt[1]) < 1e-6
+
+
+class TestReplanResilience(unittest.TestCase):
+    """A perception-driven re-plan onto an unplannable estimate keeps fetching."""
+
+    def test_refine_onto_unplannable_keeps_previous_goal(self) -> None:
+        bad = (5.5, 4.5)  # ~1.1 m from GOAL: inside the same-object gate...
+        act = _PlanFake(static_location=GOAL, arrives=False, blocked=_is(bad))
+        clock, bus, alpha = _single_owner(act)
+        alpha.step(clock.now()); clock.tick()          # begin nav to GOAL
+        t = GOAL_REFINE_INTERVAL + 5
+        # ...but the point is unplannable -> refine is rejected, GOAL kept.
+        self.assertFalse(alpha.refine_nav_goal(bad, t, robot_xy=FAR_ROBOT))
+        self.assertEqual(alpha.located_target, GOAL)
+        self.assertEqual(act.calls("goto")[-1], GOAL)  # working plan restored
+        self.assertFalse(act.failed())                 # not stranded
+        # And the next advance does NOT fail the mission.
+        alpha.step(clock.now()); clock.tick()
+        self.assertEqual(alpha.state, RobotState.OWNER_NAVIGATING)
+        self.assertNotEqual(alpha.last_result, "failed")
+
+    def test_pickup_retry_onto_unplannable_reapproaches_previous_goal(self) -> None:
+        bad = (5.5, 4.5)
+        act = _PlanFake(static_location=GOAL, arrives=True, can_pickup=False,
+                        reconfirm_location=bad, blocked=_is(bad))
+        clock, bus, alpha = _single_owner(act)
+        alpha.step(clock.now()); clock.tick()          # nav to GOAL
+        alpha.step(clock.now()); clock.tick()          # miss -> reconfirm(bad) -> retry
+        # The fresh estimate was unplannable -> retry re-approaches GOAL, not bad.
+        self.assertEqual(alpha.state, RobotState.OWNER_NAVIGATING)
+        self.assertEqual(alpha.located_target, GOAL)
+        self.assertEqual(act.calls("goto")[-1], GOAL)
+        self.assertFalse(act.failed())
+        self.assertNotIn(P.TASK_FAILED, _perfs(bus))
+
+    def test_confirm_commit_onto_unplannable_falls_back_to_standoff(self) -> None:
+        # Owner own-confirm leg (long-range sighting), then the confirmed close
+        # estimate is unplannable: fall back to a reachable standoff, don't fail.
+        far, near = (5.0, 0.0), (3.0, 0.0)
+        act = _PlanFake(static_location=far, approach_location=near,
+                        approach_after_polls=1, confirm_range=4.5, arrives=False,
+                        blocked=_is(near))
+        clock, bus, alpha = _single_owner(act)
+        for _ in range(3):                              # sight -> confirm -> commit
+            alpha.step(clock.now()); clock.tick()
+        self.assertEqual(alpha.state, RobotState.OWNER_NAVIGATING)
+        self.assertEqual(alpha.located_target, near)    # committed the confirmed goal
+        self.assertNotEqual(act.calls("goto")[-1], near)  # but routed to a standoff
+        self.assertFalse(act.failed())
+        self.assertNotIn(P.TASK_FAILED, _perfs(bus))
+
+
 if __name__ == "__main__":
     unittest.main()

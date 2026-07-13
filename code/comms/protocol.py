@@ -327,6 +327,36 @@ class RobotProtocol:
             return self._nav_target
         return None
 
+    def reset(self) -> None:
+        """Force the protocol back to IDLE, abandoning any in-flight task/assist.
+
+        The mission runner's lifecycle reset (between successive missions on a
+        reused runner) calls this so a non-terminal (timeout/stopped) mission end
+        cannot leak a mid-flight owner or searcher into the next mission — which
+        would silently drop the next order (a busy owner declines its
+        ``REQUEST_TASK``) and misattribute the outcome. Aborts any active search
+        and clears every owner/helper field without posting messages (the runner
+        halts the units and settles any carry separately). After this the robot
+        is free to accept new work (:meth:`is_idle` is True). ``last_result`` is
+        left as an informational record of the previous outcome.
+        """
+        if self._state is RobotState.ASSIST_SEARCHING:
+            self._actions.abort_search()
+        self._task = None
+        self._query_queue = []
+        self._awaiting_peer = None
+        self._pending_accept = set()
+        self._searchers = set()
+        self._reserve = []
+        self._peer_region = {}
+        self._nav_target = None
+        self._nav_target_approx = False
+        self._own_confirm = False
+        self._own_confirm_best = None
+        self._pickup_retries = 0
+        self._assist = None
+        self._state = RobotState.IDLE
+
     def refine_nav_goal(self, new_xy: XY, t: int, *, robot_xy: XY) -> bool:
         """Steer the in-flight fetch goal onto a fresher close-range estimate (D-14).
 
@@ -360,10 +390,15 @@ class RobotProtocol:
             return False
         if math.hypot(gx - float(robot_xy[0]), gy - float(robot_xy[1])) <= GOAL_REFINE_MIN_RANGE_M:
             return False  # already within pickup range of the goal — don't nudge
+        # Re-plan onto the fresh estimate, but keep the previous (reachable) goal
+        # if that estimate is momentarily unplannable (a wide-bearing confirm can
+        # land the point in a wall/shelf inflation) — a transient plan miss must
+        # not become a terminal fetch failure.
+        if not self._goto_or_revert((nx, ny), self._nav_target):
+            return False
         self._nav_target = (nx, ny)
         self._last_refine_t = t
         self._nav_issued_t = t
-        self._actions.goto(self._nav_target)
         return True
 
     def step(self, t_step: int) -> None:
@@ -448,8 +483,15 @@ class RobotProtocol:
             self._query_queue = []
             self._awaiting_peer = None
             # F3: reconstruct the absolute object position from the peer's
-            # relative report (reporter_pose + rel_offset).
-            self._begin_navigation(reconstruct_location(msg.payload), t)
+            # relative report (reporter_pose + rel_offset). A reply the peer
+            # flagged ``approx`` (it sighted the object beyond its reliable range
+            # and could not close-confirm) gets the wider refinement gate so the
+            # owner's approach can correct the long-range lever-arm error —
+            # symmetric with the searcher-find path (CONFIRM-THEN-REPORT). Absent
+            # ``approx`` == exact, so oracle-mode replies stay byte-identical.
+            approx = bool(msg.payload.get("approx", False))
+            self._begin_navigation(reconstruct_location(msg.payload), t,
+                                   approx=approx)
         else:
             self._start_next_query(t)
 
@@ -556,6 +598,29 @@ class RobotProtocol:
             text=(f"Found the {self._task.query.describe()} at "
                   f"({location[0]:.1f}, {location[1]:.1f}); heading over to fetch it."))
 
+    def _goto_or_revert(self, new_goal: XY, prev_goal: Optional[XY]) -> bool:
+        """Issue a perception-driven re-plan onto ``new_goal``; revert on failure.
+
+        Used by the mid-approach re-plans (goal refinement, pickup-retry reconfirm,
+        confirm-commit) that steer the fetch onto a fresh detector/approx estimate.
+        A fresh estimate can momentarily be unplannable (it landed in a wall/shelf
+        inflation); rather than let that hard-fail the mission on the next
+        :meth:`_advance_navigating` ``failed()`` check, restore the previous
+        already-reachable goal and keep fetching. If ``failed()`` persists even
+        after restoring the previous goal it is a genuine fall / unreachable state
+        that the normal navigation-advance surfaces on the next tick.
+
+        Returns:
+            True if the new goal planned (the caller commits its bookkeeping);
+            False if the plan failed and the previous goal was restored.
+        """
+        self._actions.goto(new_goal)
+        if new_goal == prev_goal or not self._actions.failed():
+            return True  # planned OK (or a no-op re-issue of the current goal)
+        if prev_goal is not None:
+            self._actions.goto(prev_goal)  # restore the working plan
+        return False
+
     def _advance_navigating(self, t: int) -> None:
         if self._own_confirm:
             self._advance_owner_confirm(t)
@@ -574,16 +639,25 @@ class RobotProtocol:
             # heads for the object's current best estimate rather than the stale
             # reported point (returns None -> unchanged goal in oracle mode).
             self._pickup_retries += 1
+            prev_target = self._nav_target
+            retry_goal = self._nav_target
             fresh = self._actions.reconfirm_target(self._task.query)
-            if fresh is not None and self._nav_target is not None:
+            if fresh is not None and prev_target is not None:
                 fx, fy = float(fresh[0]), float(fresh[1])
                 max_delta = (GOAL_REFINE_MAX_DELTA_APPROX_M if self._nav_target_approx
                              else GOAL_REFINE_MAX_DELTA_M)
-                if math.hypot(fx - self._nav_target[0],
-                              fy - self._nav_target[1]) <= max_delta:
-                    self._nav_target = (fx, fy)
+                if math.hypot(fx - prev_target[0],
+                              fy - prev_target[1]) <= max_delta:
+                    retry_goal = (fx, fy)
             self._nav_issued_t = t
-            self._actions.goto(self._nav_target)
+            # Re-approach the (possibly refreshed) goal, but keep the prior
+            # reachable point if the fresh estimate is unplannable (oracle mode:
+            # fresh is None -> retry_goal == prev_target, a single unchanged goto,
+            # byte-identical).
+            if self._goto_or_revert(retry_goal, prev_target):
+                self._nav_target = retry_goal
+            else:
+                self._nav_target = prev_target
         else:
             self._fail_owner("could not pick up the object", t)
 
@@ -638,6 +712,14 @@ class RobotProtocol:
             self._fail_owner("lost sight of the object before confirming", t)
             return
         self._begin_navigation(target, t, approx=approx)
+        if self._actions.failed():
+            # The committed estimate is momentarily unplannable. Rather than
+            # hard-fail the fetch on the next tick, aim for a reachable standoff
+            # short of it and let the approach-confirm / pickup machinery re-drive
+            # from closer; a genuine fall keeps ``failed()`` True and is surfaced
+            # by _advance_navigating anyway.
+            self._nav_issued_t = t
+            self._actions.goto(self._standoff_toward(target, CONFIRM_STANDOFF_M))
 
     def _begin_delivering(self, t: int) -> None:
         """Report the pickup and start carrying the object to the destination."""
@@ -697,7 +779,18 @@ class RobotProtocol:
         loc = self._actions.can_see(query)
         if loc is not None:
             # F3: report the object's position relative to my own known pose.
-            payload = self._relative_report({"query": query, "visible": True}, loc)
+            # CONFIRM-THEN-REPORT (symmetric with a searcher find): a sighting
+            # beyond the detector's reliable-report range is unreliable enough
+            # that committing it directly can strand the owner outside pickup
+            # range. A peer is ANSWERING a question, not searching, so it does
+            # NOT walk in to close-confirm — it just flags the reply ``approx``
+            # so the owner's approach refines it with the wider gate. In oracle
+            # mode ``confirm_report_range_m() is None`` -> no flag, byte-identical.
+            base: Dict[str, object] = {"query": query, "visible": True}
+            reliable = self._actions.confirm_report_range_m()
+            if reliable is not None and self._sighting_range(loc) > reliable:
+                base["approx"] = True
+            payload = self._relative_report(base, loc)
         else:
             payload = {"query": query, "visible": False}
         self._bus.post(self.callsign, msg.sender, Performative.REPORT_VISIBILITY,
@@ -798,9 +891,18 @@ class RobotProtocol:
         if assist is None:
             return
         if self._actions.failed():
-            # Can't complete the approach -> hand off the best long-range estimate
-            # flagged approx (we DID sight it; a wider owner gate recovers it).
-            self._finish_searcher_confirm(assist, assist.best_xy, approx=True)
+            # We FELL (or the standoff went unreachable) mid confirm-walk-in.
+            # Surface it as a REJECT ("searcher fell"), exactly like the ordinary
+            # patrol-fall path (_advance_searching), so the owner's _on_reject
+            # reassigns the region to a reserve peer and keeps the healthy
+            # co-searchers running. Do NOT REPORT_FOUND the unconfirmed long-range
+            # estimate: that would cancel the other searchers and commit the owner
+            # to a fallen robot's weak fix. Losing the long-range hint is
+            # acceptable — region reassignment keeps the search sound.
+            self._actions.abort_search()
+            self._bus.post(self.callsign, assist.commander, Performative.REJECT,
+                           {"reason": "searcher fell"})
+            self._end_assist()
             return
         loc = self._actions.can_see(assist.query)
         if loc is not None:

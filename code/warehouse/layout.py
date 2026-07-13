@@ -853,6 +853,17 @@ def room_of(layout: WarehouseLayout, xy: Tuple[float, float]) -> str:
 # only at 0.50 m). Every seeded layout variant must route at BOTH before use.
 _PLAN_INFLATIONS: Tuple[float, float] = (0.40, 0.45)
 
+# Object stamping for the plan gate. The deployed fleet plans on an object-STAMPED
+# grid (``planning.build_inflated_grid`` marks every non-goal object geom), so a
+# walls-only gate certifies routes the objects actually block. The gate therefore
+# stamps every object_spot as an obstacle too, leaving the pair's goal spot free
+# (approachable) within ``_GATE_EXCLUDE_RADIUS_M`` — exactly the
+# ``build_inflated_grid(goal_xy=..., exclude_radius=...)`` semantics. Every
+# warehouse fetch object (0.22-0.26 m across) stamps to the same disk at the
+# planner resolution, so one representative size is faithful.
+_GATE_OBJECT_SIZE_M: float = 0.24
+_GATE_EXCLUDE_RADIUS_M: float = 0.5
+
 
 def _all_pairs_reachable(
     layout: WarehouseLayout, *,
@@ -865,16 +876,20 @@ def _all_pairs_reachable(
     Implements the docs/multi_plan.md sec 5b gate: a seeded layout variant is
     usable only if grid A* can route every home bay to every object spot (and,
     by default, to the delivery pad) at BOTH the deployed 0.40 m clearance
-    inflation and the 0.45 m stress margin. It rasterizes the walls-only
-    occupancy grid the deployed planner shares (``occupancy_grid`` + ``inflate``)
-    and snaps endpoints within ``snap_radius_m`` exactly as the fleet's planner
-    does, so a pass here means the fleet can actually navigate the layout.
+    inflation and the 0.45 m stress margin. It rasterizes the same occupancy grid
+    the deployed planner shares and — crucially — stamps every object_spot as an
+    obstacle just like ``planning.build_inflated_grid`` does, leaving only the
+    pair's goal object approachable (``_GATE_EXCLUDE_RADIUS_M``). Walls-only
+    gating certified routes the objects actually block; stamping them closes that
+    hole so a pass here means the fleet can navigate the OBJECT-populated layout,
+    not an empty one. Endpoints snap within ``snap_radius_m`` exactly as the
+    fleet's planner does.
 
     The planner imports are deferred so ``layout.py`` keeps its load-time purity
     (no module-level planner/MuJoCo dependency); the planner is pulled in only
-    when a variant is gated. Grid reachability is undirected and transitive, so
-    gating bay->spot and bay->delivery also guarantees spot->delivery (the carry
-    leg) whenever both endpoints share the bay's connected component.
+    when a variant is gated. Reachability is checked on the object-stamped grid
+    for every bay->spot and bay->delivery pair, so a certified layout has no
+    object-blocked-only route to any target or the pad.
 
     Args:
         layout: Layout to test (hero or rooms family).
@@ -888,6 +903,7 @@ def _all_pairs_reachable(
         inflations; otherwise ``diagnostic`` names the first failing
         bay/goal/inflation.
     """
+    from code.apps.warehouse_demo.planning import add_object_obstacles
     from code.planner.astar import PathNotFoundError, plan_path
     from code.planner.grid import inflate
     from code.warehouse.occupancy import occupancy_grid
@@ -902,20 +918,40 @@ def _all_pairs_reachable(
                 goals.append(("delivery", (float(z.cx), float(z.cy))))
                 break
 
+    # Stamp every object_spot as an obstacle (the fleet plans on this grid), then
+    # inflate. The obstacle set only changes when the free (goal) object changes,
+    # so cache the inflated grid per (goal, inflation).
     og = occupancy_grid(layout, resolution)
+    gate_objects = [{"x": float(x), "y": float(y), "size": _GATE_OBJECT_SIZE_M}
+                    for (x, y) in layout.object_spots]
+    grid_cache: Dict[Tuple[float, float, float], object] = {}
+
+    def _grid_for(goal_xy: Tuple[float, float], r: float):
+        key = (round(goal_xy[0], 4), round(goal_xy[1], 4), r)
+        ig = grid_cache.get(key)
+        if ig is None:
+            stamped = (add_object_obstacles(og, gate_objects, goal_xy,
+                                            _GATE_EXCLUDE_RADIUS_M)
+                       if gate_objects else og)
+            ig = inflate(stamped, r)
+            grid_cache[key] = ig
+        return ig
+
     for r in inflations:
-        ig = inflate(og, r)
         for cs, (sx, sy, _yaw) in layout.spawn_poses.items():
             for tag, (gx, gy) in goals:
+                ig = _grid_for((gx, gy), r)
                 try:
                     path = plan_path(ig, (float(sx), float(sy)), (gx, gy),
                                      snap_radius_m=snap_radius_m)
                 except PathNotFoundError:
                     return (False, f"bay {cs} -> {tag} ({gx:.2f},{gy:.2f}) "
-                                   f"unreachable at inflation {r:.2f}")
+                                   f"unreachable at inflation {r:.2f} "
+                                   f"(object-stamped)")
                 if not path:
                     return (False, f"bay {cs} -> {tag} ({gx:.2f},{gy:.2f}) "
-                                   f"empty path at inflation {r:.2f}")
+                                   f"empty path at inflation {r:.2f} "
+                                   f"(object-stamped)")
     return True, ""
 
 

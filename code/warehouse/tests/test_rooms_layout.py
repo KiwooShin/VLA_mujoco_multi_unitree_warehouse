@@ -308,6 +308,46 @@ class TestAllPairsReachable(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("unreachable", diag)
 
+    def test_object_in_corridor_blocks_route(self) -> None:
+        # Finding 6: the gate stamps objects, so an OBJECT (not a wall) that seals
+        # the only corridor to a goal spot is now caught — a walls-only gate would
+        # certify this layout as routable.
+        from code.warehouse.layout import WallSpec
+        # A vertical corridor (two tall walls) with a ~2 m gap around y=0.
+        walls = [WallSpec(0.0, 2.5, 0.15, 1.5, height=2.0, name="corr_top"),
+                 WallSpec(0.0, -2.5, 0.15, 1.5, height=2.0, name="corr_bot")]
+        # spot0 sits IN the gap; spot1 is on the far side of the corridor.
+        layout = WarehouseLayout(
+            hall_x=10.0, hall_y=6.0, walls=walls,
+            spawn_poses={"bay": (-4.0, 0.0, 0.0)},
+            object_spots=[(0.0, 0.0), (4.0, 0.0)], name="corridor_probe")
+        # With the corridor object stamped, bay -> spot1 must thread the gap the
+        # object now seals -> rejected.
+        ok, diag = _all_pairs_reachable(layout, include_delivery=False)
+        self.assertFalse(ok)
+        self.assertIn("spot1", diag)
+        self.assertIn("object-stamped", diag)
+        # Remove the corridor object (leave only the far goal) -> the gap is clear
+        # again and the same bay -> spot1 route certifies. This is the empty-grid
+        # route a walls-only gate would have (wrongly) accepted with the object.
+        open_layout = dataclasses.replace(layout, object_spots=[(4.0, 0.0)])
+        self.assertTrue(
+            _all_pairs_reachable(open_layout, include_delivery=False)[0])
+
+    def test_committed_sampler_seeds_pass_object_stamped_gate(self) -> None:
+        # Finding 6: the 16 committed sampler seeds (rooms 0-7, hero 0-7) that the
+        # release evals ran on must still certify under the object-stamped gate
+        # (verified byte-identical layouts) — a fail here is a FINDING, not a
+        # silent reseed.
+        from code.warehouse.layout import sample_layout
+        for seed in range(8):
+            rl = sample_rooms_layout(np.random.default_rng(seed))
+            ok, diag = _all_pairs_reachable(rl)
+            self.assertTrue(ok, f"rooms seed {seed}: {diag}")
+            hl = sample_layout(np.random.default_rng(seed))
+            ok, diag = _all_pairs_reachable(hl)
+            self.assertTrue(ok, f"hero seed {seed}: {diag}")
+
 
 if __name__ == "__main__":
     unittest.main()

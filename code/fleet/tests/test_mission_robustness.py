@@ -128,5 +128,74 @@ class TestSubmitGuard(_RunnerCase):
             self.mr.submit("Bravo, fetch the red cube to the delivery pad")
 
 
+class TestResetMissionLifecycle(_RunnerCase):
+    """Audit findings 3/4/5: reset_mission returns the fleet to a clean idle state.
+
+    Reproduces the report recipes: a mid-flight (non-terminal) mission end must
+    not leak an owner/searcher into the next mission (dropping the order and
+    misattributing the outcome), the deferred F2 target ring must not lock onto
+    the PRIOR mission's delivered object, and the heavy confirmations buffer must
+    not grow unbounded across a reused runner.
+    """
+
+    def test_midflight_reset_idles_and_accepts_next_order(self) -> None:  # finding 3
+        mr = self.mr
+        t1 = mr.submit("Alpha, fetch the red cube to the delivery pad")
+        mr.run(8)  # a few steps: Alpha is fetching, nowhere near delivered
+        self.assertFalse(mr.protocols["Alpha"].is_idle())      # mid-flight
+        self.assertEqual(mr.protocols["Alpha"]._task.query, t1.query)
+
+        mr.reset_mission()  # a non-terminal (timeout-style) end
+        self.assertTrue(all(p.is_idle() for p in mr.protocols.values()))
+        self.assertIsNone(mr.protocols["Alpha"]._task)
+        self.assertIsNone(mr.fleet.units["Alpha"].goal_xy)      # goal halted
+
+        # A DIFFERENT next order must be accepted, not silently declined.
+        t2 = mr.submit("Alpha, fetch the blue cylinder to the delivery pad")
+        self.assertNotEqual(t1.query, t2.query)
+        mr.run(3)
+        self.assertEqual(mr.protocols["Alpha"]._task.query, t2.query)
+
+    def test_reset_clears_carry_released_and_target_lock(self) -> None:  # finding 4
+        mr = self.mr
+        mr.submit("Alpha, fetch the red cube to the delivery pad")
+        # Simulate a mission-1 delivery: released[Alpha]=6 (the red cube index),
+        # the F2 ring locked onto that object.
+        mr.carry.released = {"Alpha": 6}
+        mr._target_index = 6
+
+        mr.reset_mission()
+        self.assertEqual(mr.carry.released, {})
+        self.assertIsNone(mr._target_index)
+
+        # The next mission's ring must not re-derive the prior delivered object.
+        mr.submit("Alpha, fetch the blue cylinder to the delivery pad")
+        mr._update_target_knowledge()
+        self.assertIsNone(mr._target_index)
+
+    def test_reset_clears_confirmations(self) -> None:  # finding 5
+        mr = self.mr
+        mr.submit("Alpha, fetch the red cube to the delivery pad")
+        mr.confirmations.append((0, object()))  # a heavy DetectionResult stand-in
+        mr.reset_mission()
+        self.assertEqual(mr.confirmations, [])
+
+    def test_reset_raises_if_a_protocol_cannot_idle(self) -> None:  # finding 3 guard
+        mr = self.mr
+        mr.submit("Alpha, fetch the red cube to the delivery pad")
+        mr.run(6)
+        self.assertFalse(mr.protocols["Alpha"].is_idle())
+        # Neuter one protocol's reset so it stays non-idle; reset_mission must
+        # refuse (raise) rather than silently drop the next order.
+        stuck = mr.protocols["Alpha"]
+        orig = stuck.reset
+        stuck.reset = lambda: None  # type: ignore[assignment]
+        try:
+            with self.assertRaises(RuntimeError):
+                mr.reset_mission()
+        finally:
+            stuck.reset = orig
+
+
 if __name__ == "__main__":
     unittest.main()

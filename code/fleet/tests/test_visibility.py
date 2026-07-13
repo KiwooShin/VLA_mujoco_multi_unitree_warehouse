@@ -145,6 +145,36 @@ class TestPartialVisibilitySampledLOS(unittest.TestCase):
         self.assertTrue(V.line_of_sight_clear((0, 0), (2, 0), [], head_z=1.2,
                                               obj_z=0.1, obj_radius=0.2))
 
+    def _count_segment_calls(self, *args, **kwargs) -> int:
+        """Return how many _segment_los_clear passes line_of_sight_clear makes."""
+        orig = V._segment_los_clear
+        n = {"c": 0}
+
+        def counting(*a, **k):
+            n["c"] += 1
+            return orig(*a, **k)
+
+        V._segment_los_clear = counting  # type: ignore[assignment]
+        try:
+            V.line_of_sight_clear(*args, **kwargs)
+        finally:
+            V._segment_los_clear = orig
+        return n["c"]
+
+    def test_centre_clear_costs_one_segment_test(self) -> None:
+        # Finding 8b: the common case (centre in the clear) must test the CENTRE
+        # segment first and return early — no extent sampling — so it costs a
+        # single _segment_los_clear pass, not 5. (Result unchanged: still visible.)
+        n = self._count_segment_calls((0, 0), (2, 0), [], head_z=1.2,
+                                      obj_z=0.1, obj_radius=0.2)
+        self.assertEqual(n, 1)
+
+    def test_centre_occluded_samples_the_four_edges(self) -> None:
+        # Only when the centre is blocked does it pay for the 4 extent samples.
+        n = self._count_segment_calls((0, 0), (2, 0), self._FULL_WALL,
+                                      head_z=1.2, obj_z=0.1, obj_radius=0.2)
+        self.assertEqual(n, 5)  # centre + 4 cardinal edges
+
 
 class TestSegmentGeometry(unittest.TestCase):
     def test_segment_aabb_hit_and_miss(self) -> None:

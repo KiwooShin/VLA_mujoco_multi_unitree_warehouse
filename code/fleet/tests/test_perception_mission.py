@@ -88,6 +88,63 @@ class TestGroundnetMission(unittest.TestCase):
             mr.close()
 
 
+class TestOwnConfirmSingleRender(unittest.TestCase):
+    """Finding 8a: the owner own-confirm leg renders the grounding cam once/step."""
+
+    def test_own_confirm_leg_does_not_double_render(self) -> None:
+        # Alpha's red cube (spot 6) is 5.5 m away (> the 4.5 m reliable range), so
+        # a groundnet fetch runs the CONFIRM-THEN-REPORT own-confirm walk-in. The
+        # protocol's own can_see already renders + confirms each of those steps;
+        # _owner_approach_confirm must NOT render a second time (it would double
+        # the dominant GPU cost and drop the first confirmation's telemetry).
+        from code.comms.protocol import RobotState
+        _require_ckpt()
+        try:
+            mr = _make_runner("groundnet")
+        except unittest.SkipTest:
+            raise
+        except Exception as e:  # pragma: no cover - environment-dependent
+            raise unittest.SkipTest(f"WBC/MuJoCo/EGL unavailable: {e}")
+        try:
+            p = mr.perceptions["Alpha"]
+            orig_confirm = p.confirm
+            per_step = {"n": 0}
+            own_confirm_max = {"n": 0}
+            own_confirm_steps = {"n": 0}
+
+            def counting_confirm(*a, **k):
+                per_step["n"] += 1
+                return orig_confirm(*a, **k)
+
+            p.confirm = counting_confirm  # type: ignore[assignment]
+            double_steps = {"n": 0}
+
+            def hook(runner, t):
+                proto = runner.protocols["Alpha"]
+                if (proto.state is RobotState.OWNER_NAVIGATING
+                        and proto.located_target is None):  # own-confirm leg
+                    own_confirm_steps["n"] += 1
+                    own_confirm_max["n"] = max(own_confirm_max["n"], per_step["n"])
+                    if per_step["n"] > 1:
+                        double_steps["n"] += 1
+                per_step["n"] = 0
+                return None
+
+            mr.submit("Alpha, fetch the red cube to the delivery pad")
+            res = mr.run(2600, on_step=hook)
+            self.assertEqual(res.outcome, "complete")
+            # The own-confirm leg ran for many steps (5.5 m walk-in to the standoff).
+            self.assertGreater(own_confirm_steps["n"], 3)
+            # Before the fix _owner_approach_confirm rendered a SECOND time every
+            # step of the leg. Now the leg renders once/step throughout its
+            # duration; only the entry step can carry an extra render (the
+            # task-receipt view check preceding the confirm leg), never the leg
+            # itself — so at most one own-confirm step double-renders.
+            self.assertLessEqual(double_steps["n"], 1)
+        finally:
+            mr.close()
+
+
 class TestModeParity(unittest.TestCase):
     """Oracle and groundnet modes both complete the same visible fetch."""
 

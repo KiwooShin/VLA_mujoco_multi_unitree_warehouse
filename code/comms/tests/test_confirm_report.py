@@ -246,5 +246,107 @@ class TestApproxReportWiderRefineGate(unittest.TestCase):
         self.assertEqual(alpha.located_target, LOC)   # goal unchanged
 
 
+def _visibility_replies(bus: MessageBus):
+    return [m for m in bus.transcript
+            if m.performative is P.REPORT_VISIBILITY and m.payload.get("visible")]
+
+
+def _peer_reply(act: FakeActions):
+    """A lone peer that answers one QUERY_VISIBILITY for the red cube."""
+    clock = FakeClock()
+    bus = MessageBus(clock.now)
+    bravo = RobotProtocol("Bravo", bus, act, peers=("Alpha",))
+    bus.post("Alpha", "Bravo", P.QUERY_VISIBILITY, {"query": Q})
+    bravo.step(clock.now()); clock.tick()
+    return bus, bravo
+
+
+# ---------------------------------------------------------------------------
+# Peer QUERY_VISIBILITY reply: CONFIRM-THEN-REPORT parity (approx flag)
+# ---------------------------------------------------------------------------
+class TestPeerVisibilityReplyApprox(unittest.TestCase):
+    """A peer's long-range visibility reply is flagged approx (no walk-in)."""
+
+    def test_long_range_reply_flagged_approx_no_walk_in(self) -> None:
+        act = FakeActions(static_location=FAR, confirm_range=RELIABLE,
+                          pose=(0.0, 0.0))
+        bus, bravo = _peer_reply(act)
+        reps = _visibility_replies(bus)
+        self.assertEqual(len(reps), 1)
+        self.assertTrue(reps[0].payload.get("approx"))       # 5 m > 4.5 m reliable
+        self.assertEqual(reconstruct_location(reps[0].payload), FAR)
+        # A peer answers a question; it does NOT walk in to close-confirm.
+        self.assertEqual(act.calls("goto"), [])
+        self.assertTrue(bravo.is_idle())
+
+    def test_close_range_reply_not_flagged(self) -> None:
+        act = FakeActions(static_location=NEAR, confirm_range=RELIABLE,
+                          pose=(0.0, 0.0))
+        bus, _ = _peer_reply(act)
+        self.assertNotIn("approx", _visibility_replies(bus)[0].payload)  # 3 m <= 4.5 m
+
+    def test_oracle_mode_reply_byte_identical(self) -> None:
+        # confirm_range=None (oracle): no approx key even for a far sighting.
+        act = FakeActions(static_location=FAR, confirm_range=None, pose=(0.0, 0.0))
+        bus, _ = _peer_reply(act)
+        self.assertNotIn("approx", _visibility_replies(bus)[0].payload)
+
+
+class TestOwnerCommitsPeerApprox(unittest.TestCase):
+    """The owner commits a long-range peer reply with the WIDER refine gate."""
+
+    def test_owner_commits_approx_and_widens_refine_gate(self) -> None:
+        actions = {"Alpha": FakeActions(confirm_range=RELIABLE, arrives=False),
+                   "Bravo": FakeActions(static_location=FAR, confirm_range=RELIABLE),
+                   "Charlie": FakeActions(confirm_range=RELIABLE),
+                   "Delta": FakeActions(confirm_range=RELIABLE)}
+        fx = _FleetFixture(actions, regions=("north", "middle", "south"))
+        fx.bus.post("user", "Alpha", P.REQUEST_TASK, {"task": _task()})
+        pump(fx.clock, fx.order(CALLSIGNS), 8)
+
+        reps = _visibility_replies(fx.bus)
+        self.assertTrue(reps and reps[0].payload.get("approx"))
+        self.assertEqual(fx.alpha.state, RobotState.OWNER_NAVIGATING)
+        self.assertEqual(fx.alpha.located_target, FAR)   # committed the raw estimate
+        # Because the commit was flagged approx, a 3 m nudge (beyond the 2.5 m
+        # exact gate, inside the 4.0 m approx gate) is now accepted during approach.
+        self.assertGreater(3.0, GOAL_REFINE_MAX_DELTA_M)
+        self.assertLessEqual(3.0, GOAL_REFINE_MAX_DELTA_APPROX_M)
+        wide = (FAR[0] + 3.0, FAR[1])
+        self.assertTrue(fx.alpha.refine_nav_goal(wide, 1000, robot_xy=(0.0, 0.0)))
+        self.assertEqual(fx.alpha.located_target, wide)
+
+
+# ---------------------------------------------------------------------------
+# Searcher fall mid confirm-walk-in -> REJECT (not an approx REPORT_FOUND)
+# ---------------------------------------------------------------------------
+class TestSearcherFallDuringConfirm(unittest.TestCase):
+    """A fall mid confirm-approach surfaces as a REJECT, not a weak find."""
+
+    def test_fall_mid_confirm_rejects_and_does_not_report(self) -> None:
+        act = FakeActions(search_location=FAR, approach_location=None,
+                          static_location=FAR, find_after_polls=0, arrives=False,
+                          confirm_range=RELIABLE)
+        clock, bus, bravo = _searcher(act)
+        for _ in range(4):                       # find long-range -> enter confirm
+            bravo.step(clock.now()); clock.tick()
+            if STANDOFF in act.calls("goto"):
+                break
+        self.assertIn(STANDOFF, act.calls("goto"))
+        self.assertEqual(_reports(bus), [])      # nothing reported yet
+        # Fall while walking in to confirm.
+        act.nav_fails, act.fail_reason = True, "searcher fell"
+        bravo.step(clock.now()); clock.tick()
+
+        rej = [m for m in bus.transcript if m.performative is P.REJECT]
+        self.assertEqual(len(rej), 1)
+        self.assertEqual((rej[0].sender, rej[0].recipient), ("Bravo", "Alpha"))
+        self.assertEqual(rej[0].payload["reason"], "searcher fell")
+        # It must NOT emit an (approx) REPORT_FOUND — that would cancel healthy
+        # co-searchers and commit the owner to a fallen robot's weak estimate.
+        self.assertEqual(_reports(bus), [])
+        self.assertTrue(bravo.is_idle())
+
+
 if __name__ == "__main__":
     unittest.main()

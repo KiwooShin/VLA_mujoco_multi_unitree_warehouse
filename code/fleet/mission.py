@@ -311,6 +311,14 @@ class MissionRunner:
                 or self.carry.carrying(owner)
                 or self.protocols[owner].state is not RobotState.OWNER_NAVIGATING):
             return
+        if self.protocols[owner].located_target is None:
+            # Own-confirm leg (walking to the standoff, no committed goal yet):
+            # the protocol's own can_see() already renders + confirms the target
+            # this step, so running the confirmer here would double-render the
+            # grounding cam (the dominant GPU cost) and overwrite that
+            # confirmation's telemetry before it is recorded. There is also
+            # nothing to refine (no committed _nav_target), so skip — render once.
+            return
         tgt = self.target_xy()
         if tgt is None:
             return
@@ -368,10 +376,41 @@ class MissionRunner:
         self._target_index = None
         self._cancelled = False
         self.trails = {c: [] for c in self.callsigns}
+        # Heavy DetectionResult payloads (a full grounding RGB frame + heatmap
+        # each): never carry a prior mission's confirmations into the next one
+        # (unbounded growth + cumulative n_confirmations on a reused runner).
+        self.confirmations = []
         self._mission_base = len(self.bus.transcript)
         self._submitted = 0
+        # Make the fleet ACTUALLY idle. A non-terminal (timeout/stopped) mission
+        # end can leave a protocol mid-flight (OWNER_NAVIGATING/DELEGATING, or a
+        # searcher still in the confirm sub-state); reusing it without a reset
+        # silently drops the next order (a busy owner declines its REQUEST_TASK)
+        # and misattributes the outcome. Force every protocol to IDLE, halt every
+        # unit's goal and stop every search controller.
+        for cs in self.callsigns:
+            self.protocols[cs].reset()
+            self._search[cs].stop()
+            self.fleet.units[cs].halt()
+        # Settle any object still HELD in flight where it stands (drop-in-place);
+        # already-delivered objects rest on the pad and stay there (continuous
+        # world). No new message — the drop is visible in the object's pose.
+        for cs in self.callsigns:
+            if self.carry.carrying(cs):
+                self.carry.drop_here(cs)
+        # Clear cross-mission carry bookkeeping (released/_carry/_dest): otherwise
+        # _update_target_knowledge re-derives _target_index from a PRIOR mission's
+        # released object and locks the F2 ring onto the wrong object at step 0.
+        self.carry.reset()
         for p in self.perceptions.values():
             p.reset()
+        # Refuse a silently-dropped submit: if any protocol is still non-idle the
+        # next REQUEST_TASK would be declined and the order lost — fail loudly
+        # rather than run a phantom mission.
+        if not all(p.is_idle() for p in self.protocols.values()):
+            raise RuntimeError(
+                "reset_mission could not return all robots to idle; a mission "
+                "may still be in flight")
 
     def submit(self, text: str) -> TaskSpec:
         """Parse and post a natural-language order onto the bus.

@@ -114,6 +114,22 @@ class CarryManager:
         self._dest: Dict[str, XY] = {}             # robot -> delivery destination
         self.released: Dict[str, int] = {}         # robot -> delivered object index
 
+    # -- lifecycle --------------------------------------------------------
+    def reset(self) -> None:
+        """Clear cross-mission carry bookkeeping (called from reset_mission).
+
+        Drops the per-robot carried / destination / delivered-index maps so the
+        next mission starts with no carry history. Any object still HELD in flight
+        should be settled first (``drop_here``) by the caller; delivered objects
+        already rest on the pad and stay there (the world is continuous). Clearing
+        :attr:`released` in particular stops the next mission's deferred target
+        ring / approach-confirm from locking onto the PREVIOUS mission's delivered
+        object at step 0.
+        """
+        self._carry.clear()
+        self._dest.clear()
+        self.released.clear()
+
     # -- queries ----------------------------------------------------------
     def carrying(self, robot: str) -> bool:
         """Whether ``robot`` is currently carrying an object."""

@@ -27,6 +27,12 @@ COLOR_WORDS: tuple[str, ...] = (
     "red", "yellow", "blue", "green", "orange", "purple", "cyan")
 SHAPE_WORDS: tuple[str, ...] = ("ball", "cube", "cylinder", "cone")
 
+# F4 — generic object reference (mirrors code.fleet.mission._is_generic_reference).
+_GENERIC_NOUNS: tuple[str, ...] = ("object", "item")
+_GENERIC_PRONOUNS: tuple[str, ...] = ("something", "anything")
+_FETCH_VERBS: tuple[str, ...] = (
+    "bring", "fetch", "get", "grab", "carry", "deliver", "take", "retrieve")
+
 # Words that legitimately open an order without being a callsign (greetings +
 # fleet/broadcast words), used to suppress the unknown-callsign heuristic.
 _NON_CALLSIGN_LEAD = {
@@ -69,6 +75,10 @@ def _resolve_object(body: str) -> Optional[str]:
     color = next((c for c in COLOR_WORDS if f" {c}" in low), None)
     shape = next((s for s in SHAPE_WORDS if f" {s}" in low), None)
     if color is None and shape is None:
+        if (any(f" {n} " in low for n in _GENERIC_NOUNS)
+                or (any(f" {p} " in low for p in _GENERIC_PRONOUNS)
+                    and any(f" {v} " in low for v in _FETCH_VERBS))):
+            return "object"  # F4: generic "the object" reference
         return None
     if color and shape:
         return f"{color} {shape}"

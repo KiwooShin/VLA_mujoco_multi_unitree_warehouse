@@ -29,12 +29,19 @@ from __future__ import annotations
 import abc
 import dataclasses
 import enum
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from code.comms.bus import MessageBus
-from code.comms.messages import Message, ObjectQuery, Performative, TaskSpec
+from code.comms.messages import (Message, ObjectQuery, Performative, TaskSpec,
+                                 reconstruct_location, relative_report_payload)
 
 XY = Tuple[float, float]
+
+# A region-assignment strategy: given the idle peers available to search (in
+# reserve order) and the region labels to cover, return the ``(peer, region)``
+# pairs to command. The default (``None``) zips peers to regions in order; the
+# fleet layer injects an A*-nearest-room assigner for the multi-room layout.
+RegionAssigner = Callable[[Sequence[str], Sequence[str]], List[Tuple[str, str]]]
 
 # How many times a missed mock pickup is re-attempted (re-approach) before the
 # owner declares the fetch failed. One retry is enough for a transient miss.
@@ -82,6 +89,17 @@ class RobotActions(abc.ABC):
     @abc.abstractmethod
     def can_see(self, query: ObjectQuery) -> Optional[XY]:
         """Return the object's world ``(x, y)`` if currently visible, else ``None``."""
+
+    def report_origin(self) -> Tuple[XY, str]:
+        """Return the reporter's own ``(x, y)`` pose and its region/room name.
+
+        Used to build the F3 relative-position report payload: each robot knows
+        its own pose exactly, so it reports the object's offset relative to
+        itself plus the room it is standing in. The base implementation returns
+        ``((0.0, 0.0), "the area")`` so scripted test fakes keep working; the
+        fleet bridge overrides it with the robot's true pose and current room.
+        """
+        return ((0.0, 0.0), "the area")
 
     @abc.abstractmethod
     def goto(self, xy: XY) -> None:
@@ -168,7 +186,8 @@ class RobotProtocol:
                  peers: Sequence[str], *,
                  search_regions: Sequence[str] = DEFAULT_REGIONS,
                  reply_deadline_steps: int = 50,
-                 search_deadline_steps: int = 2000) -> None:
+                 search_deadline_steps: int = 2000,
+                 region_assigner: Optional[RegionAssigner] = None) -> None:
         self.callsign = callsign
         self._bus = bus
         self._actions = actions
@@ -176,6 +195,7 @@ class RobotProtocol:
         self._regions: Tuple[str, ...] = tuple(search_regions)
         self._reply_deadline = int(reply_deadline_steps)
         self._search_deadline_steps = int(search_deadline_steps)
+        self._region_assigner = region_assigner
 
         self._state = RobotState.IDLE
         self.last_result: Optional[str] = None  # "complete" | "failed" | None
@@ -206,6 +226,21 @@ class RobotProtocol:
     def is_idle(self) -> bool:
         """Return whether the robot is free to accept new work."""
         return self._state is RobotState.IDLE
+
+    @property
+    def located_target(self) -> Optional[XY]:
+        """The object position this owner has located, or ``None`` (F2).
+
+        Set once the owner begins navigating to a located object — whether from
+        its own first sighting, a peer's visibility report or a searcher's find —
+        and held through delivery; ``None`` while still querying / delegating or
+        when idle. Lets the mission layer defer the target ring until the object
+        is actually known and draw it at the reported position.
+        """
+        if self._state in (RobotState.OWNER_NAVIGATING,
+                            RobotState.OWNER_DELIVERING):
+            return self._nav_target
+        return None
 
     def step(self, t_step: int) -> None:
         """Advance the state machine by one simulation step.
@@ -274,7 +309,9 @@ class RobotProtocol:
         if msg.payload.get("visible"):
             self._query_queue = []
             self._awaiting_peer = None
-            self._begin_navigation(msg.payload["location"], t)
+            # F3: reconstruct the absolute object position from the peer's
+            # relative report (reporter_pose + rel_offset).
+            self._begin_navigation(reconstruct_location(msg.payload), t)
         else:
             self._start_next_query(t)
 
@@ -286,12 +323,25 @@ class RobotProtocol:
         self._peer_region = {}
         self._reserve = list(self._peers)
         self._search_deadline = t + self._search_deadline_steps
-        for region in self._regions:
-            if not self._reserve:
-                break  # more regions than peers: leave the rest uncovered
-            self._command_search(self._reserve.pop(0), region)
+        for peer, region in self._plan_assignment(self._reserve, self._regions):
+            self._reserve.remove(peer)
+            self._command_search(peer, region)
         if not self._pending_accept:
             self._fail_owner("no robots available to search", t)
+
+    def _plan_assignment(self, peers: Sequence[str],
+                         regions: Sequence[str]) -> List[Tuple[str, str]]:
+        """Return the ``(peer, region)`` search assignments for delegation.
+
+        With the default (``region_assigner is None``) each region is handed to
+        the next reserve peer in order — the historical behaviour (more regions
+        than peers leaves the surplus uncovered). The fleet layer injects an
+        A*-nearest-room assigner so, on the multi-room layout, each searcher
+        takes the nearest unsearched room.
+        """
+        if self._region_assigner is not None:
+            return list(self._region_assigner(peers, regions))
+        return [(peer, region) for peer, region in zip(peers, regions)]
 
     def _command_search(self, peer: str, region: str) -> None:
         self._peer_region[peer] = region
@@ -337,7 +387,9 @@ class RobotProtocol:
             return
         reporter = msg.sender
         self._cancel_active_searchers(exclude=reporter)
-        self._begin_navigation(msg.payload["location"], t)
+        # F3: reconstruct the absolute object position from the searcher's
+        # relative report (reporter_pose + rel_offset).
+        self._begin_navigation(reconstruct_location(msg.payload), t)
 
     def _cancel_active_searchers(self, exclude: Optional[str] = None) -> None:
         """Call off every active/pending searcher (in fixed peer order for determinism)."""
@@ -428,11 +480,23 @@ class RobotProtocol:
     def _on_query_visibility(self, msg: Message, t: int) -> None:
         query = msg.payload["query"]
         loc = self._actions.can_see(query)
-        payload = {"query": query, "visible": loc is not None}
         if loc is not None:
-            payload["location"] = loc
+            # F3: report the object's position relative to my own known pose.
+            payload = self._relative_report({"query": query, "visible": True}, loc)
+        else:
+            payload = {"query": query, "visible": False}
         self._bus.post(self.callsign, msg.sender, Performative.REPORT_VISIBILITY,
                        payload, in_reply_to=msg.msg_id)
+
+    def _relative_report(self, base: dict, obj_xy: XY) -> dict:
+        """Build an F3 relative-position report payload for ``obj_xy``.
+
+        Asks the world bridge for my own exact pose + current room and encodes
+        the object as an offset from me (the receiver reconstructs the absolute
+        position with :func:`code.comms.messages.reconstruct_location`).
+        """
+        (rx, ry), room = self._actions.report_origin()
+        return relative_report_payload((rx, ry), room, obj_xy, extra=base)
 
     def _on_command_search(self, msg: Message, t: int) -> None:
         if msg.payload.get("cancel"):
@@ -483,8 +547,9 @@ class RobotProtocol:
         loc = self._actions.can_see(assist.query)
         if loc is not None:
             # Need-to-know: the find goes to the commander ONLY, then we stop.
+            # F3: report the object relative to my own known pose + room.
             self._bus.post(self.callsign, assist.commander, Performative.REPORT_FOUND,
-                           {"object": assist.query, "location": loc})
+                           self._relative_report({"object": assist.query}, loc))
             self._actions.abort_search()
             self._end_assist()
 

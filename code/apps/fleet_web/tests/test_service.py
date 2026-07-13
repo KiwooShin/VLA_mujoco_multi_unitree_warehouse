@@ -113,8 +113,10 @@ class ServiceLoopTest(unittest.TestCase):
             lambda: self.svc.snapshot_state(0)["next_id"] > after_first
             and self.svc.snapshot_state(0)["mission"]["outcome"] == "complete"
             and not self.svc.snapshot_state(0)["mission"]["active"]))
-        # A rebuild happened for the 2nd order (initial reset + 1 rebuild).
-        self.assertGreaterEqual(self.engine.reset_count, 2)
+        # Lifecycle API: the world is built ONCE (single boot reset) and reused;
+        # the 2nd order runs after a per-mission reset, not a rebuild.
+        self.assertEqual(self.engine.reset_count, 1)
+        self.assertGreaterEqual(self.engine.reset_mission_count, 1)
         # Incremental fetch returns only the 2nd mission's lines.
         newer = self.svc.snapshot_state(after_first)["transcript"]
         self.assertTrue(newer)

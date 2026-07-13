@@ -29,6 +29,7 @@ from code.comms.messages import ObjectQuery
 from code.fleet.search import SEARCH_REGIONS, free_centroid, region_centroid
 from code.fleet.visibility import VisibilityConfig, is_object_visible
 from code.planner.astar import PathNotFoundError, path_length, plan_path, shortcut_path
+from code.warehouse.layout import Room
 
 XY = Tuple[float, float]
 
@@ -107,15 +108,15 @@ def planned_path_length(scene_cfg: dict, start_xy: XY, goal_xy: XY, *,
     return path_length(shortcut_path(grid, raw))
 
 
-def _nearest_region(xy: XY, scene_cfg: dict,
-                    regions: Sequence[str]) -> Tuple[str, XY]:
+def _nearest_region(xy: XY, scene_cfg: dict, regions: Sequence[str],
+                    rooms: Sequence[Room] = ()) -> Tuple[str, XY]:
     """Return the region whose centroid is nearest ``xy`` and that centroid."""
     hall_x, hall_y = float(scene_cfg["hall_x"]), float(scene_cfg["hall_y"])
     best_r = regions[0]
-    best_c = region_centroid(regions[0], hall_x, hall_y)
+    best_c = region_centroid(regions[0], hall_x, hall_y, rooms)
     best_d = float("inf")
     for r in regions:
-        cx, cy = region_centroid(r, hall_x, hall_y)
+        cx, cy = region_centroid(r, hall_x, hall_y, rooms)
         d = (cx - xy[0]) ** 2 + (cy - xy[1]) ** 2
         if d < best_d:
             best_d, best_r, best_c = d, r, (cx, cy)
@@ -145,17 +146,21 @@ def _visible_object_xy(poses: Dict[str, RobotPose], scene_cfg: dict,
 def allocate(poses: Dict[str, RobotPose], scene_cfg: dict, query: ObjectQuery,
              idle: Sequence[str], *,
              vis_cfg: Optional[VisibilityConfig] = None,
-             regions: Sequence[str] = SEARCH_REGIONS) -> AllocationResult:
+             regions: Sequence[str] = SEARCH_REGIONS,
+             rooms: Sequence[Room] = ()) -> AllocationResult:
     """Choose the idle robot with the shortest planned path to the work.
 
     Args:
         poses: callsign -> :class:`RobotPose` for every robot (visibility uses
             all of them; only ``idle`` robots are scored/assignable).
         scene_cfg: Shared warehouse scene_cfg.
-        query: The requested object.
+        query: The requested object (may be the generic wildcard — the first
+            visible matching object anchors the visible-mode cost).
         idle: Idle callsigns, in callsign (tie-break) order.
         vis_cfg: Visibility-oracle geometry.
         regions: Region labels for search-mode scoring.
+        rooms: The layout's rooms (rooms mode) so region centroids/patrols use
+            room footprints; empty for the hero thirds.
 
     Returns:
         An :class:`AllocationResult`; ``winner`` is ``None`` if ``idle`` is empty
@@ -175,9 +180,9 @@ def allocate(poses: Dict[str, RobotPose], scene_cfg: dict, query: ObjectQuery,
         if obj_xy is not None:
             targets[cs] = obj_xy
         else:
-            region, _ = _nearest_region(pose.xy, scene_cfg, regions)
+            region, _ = _nearest_region(pose.xy, scene_cfg, regions, rooms)
             assigned_region[cs] = region
-            targets[cs] = free_centroid(scene_cfg, region)
+            targets[cs] = free_centroid(scene_cfg, region, rooms=rooms)
         costs[cs] = planned_path_length(scene_cfg, pose.xy, targets[cs])
 
     winner: Optional[str] = None

@@ -21,6 +21,8 @@ from code.comms.messages import (
     Performative,
     TaskKind,
     TaskSpec,
+    reconstruct_location,
+    relative_report_payload,
 )
 from code.comms.protocol import (
     DEFAULT_REGIONS,
@@ -40,6 +42,8 @@ __all__ = [
     "Performative",
     "TaskKind",
     "TaskSpec",
+    "reconstruct_location",
+    "relative_report_payload",
     "RobotActions",
     "RobotProtocol",
     "RobotState",

@@ -10,6 +10,8 @@ from code.comms.messages import (
     Performative,
     TaskKind,
     TaskSpec,
+    reconstruct_location,
+    relative_report_payload,
 )
 
 
@@ -46,6 +48,28 @@ class TestObjectQuery(unittest.TestCase):
         with self.assertRaises(Exception):
             q.color_name = "blue"  # type: ignore[misc]
 
+    def test_is_generic(self) -> None:  # F4
+        self.assertTrue(ObjectQuery(None, None).is_generic)
+        self.assertTrue(ObjectQuery().is_generic)
+        self.assertFalse(ObjectQuery("red", None).is_generic)
+        self.assertFalse(ObjectQuery(None, "cube").is_generic)
+        # A generic query matches every object (first found wins).
+        self.assertTrue(ObjectQuery(None, None).matches(
+            {"color_name": "orange", "shape_name": "cone"}))
+
+
+class TestRelativeReports(unittest.TestCase):  # F3
+    def test_roundtrip_reconstructs_absolute(self) -> None:
+        payload = relative_report_payload((2.0, -1.0), "storage A", (6.5, 4.7),
+                                          extra={"object": ObjectQuery("red", "cube")})
+        self.assertEqual(payload["reporter_pose"], (2.0, -1.0))
+        self.assertEqual(payload["room"], "storage A")
+        self.assertEqual(payload["rel_offset"], (4.5, 5.7))
+        self.assertNotIn("location", payload)  # no transmitted absolute
+        x, y = reconstruct_location(payload)
+        self.assertAlmostEqual(x, 6.5)
+        self.assertAlmostEqual(y, 4.7)
+
 
 class TestTaskSpec(unittest.TestCase):
     def test_describe(self) -> None:
@@ -60,14 +84,18 @@ class TestTaskSpec(unittest.TestCase):
 
 
 class TestMessageValidation(unittest.TestCase):
-    def test_report_found_requires_object_and_location(self) -> None:
+    def test_report_found_requires_relative_fields(self) -> None:
+        # F3: REPORT_FOUND carries a relative report (object + reporter_pose +
+        # rel_offset), never a transmitted absolute location.
         with self.assertRaises(ValueError):
             _msg(Performative.REPORT_FOUND, {"object": ObjectQuery("red", "cube")})
         with self.assertRaises(ValueError):
-            _msg(Performative.REPORT_FOUND, {"location": (1.0, 2.0)})
-        # Both present -> valid.
+            _msg(Performative.REPORT_FOUND,
+                 {"reporter_pose": (0.0, 0.0), "rel_offset": (1.0, 2.0)})
+        # All three present -> valid.
         _msg(Performative.REPORT_FOUND,
-             {"object": ObjectQuery("red", "cube"), "location": (1.0, 2.0)})
+             {"object": ObjectQuery("red", "cube"),
+              "reporter_pose": (0.0, 0.0), "rel_offset": (1.0, 2.0)})
 
     def test_required_keys_per_performative(self) -> None:
         cases = {

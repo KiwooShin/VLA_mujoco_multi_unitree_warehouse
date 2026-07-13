@@ -21,7 +21,7 @@ import traceback
 from typing import Dict, List, Optional
 
 from code.apps.fleet_web.commands import validate_command
-from code.apps.fleet_web.engine import SimEngine, StopSim
+from code.apps.fleet_web.engine import SimEngine
 from code.apps.fleet_web.status import robot_view
 from code.apps.fleet_web.transcript import TranscriptLog, kind_for
 
@@ -171,7 +171,7 @@ class FleetService:
             self._reset_ingest()
             self._refresh(render=True)
             self._set(status="Fleet ready — type an order or tap an example.")
-            need_rebuild = False
+            missions_run = False
             while not self._stop.is_set():
                 text = self._next_command()
                 if text is None:
@@ -179,15 +179,14 @@ class FleetService:
                     self._refresh(render=True)
                     self._pace()
                     continue
-                if need_rebuild:
-                    self._set(status="Resetting the warehouse for the next order…")
-                    self._refresh(render=True)
-                    self._engine.reset()
-                    self._reset_ingest()
+                # Lifecycle API: reuse the built fleet across missions — clear
+                # the previous mission's state (continuous world), no rebuild.
+                if missions_run:
+                    self._engine.reset_mission()
                 self._begin(text)
                 outcome = self._engine.run_mission(self._on_step, self._max_steps)
                 self._finish(text, outcome)
-                need_rebuild = True
+                missions_run = True
         except Exception:  # never let the worker die silently
             traceback.print_exc()
             self._set(status="Sim error — see server logs.")
@@ -216,14 +215,19 @@ class FleetService:
                   status=f"On it — {check.recipient_label}: "
                          f"fetch the {check.target_desc}.")
 
-    def _on_step(self, t: int) -> None:
-        """Per-sim-step hook: ingest chatter, render, pace, honour shutdown."""
+    def _on_step(self, t: int) -> object:
+        """Per-sim-step hook: ingest chatter, render, pace, honour shutdown.
+
+        Returns ``False`` to cancel the active run promptly on shutdown (the
+        runner's public stop contract), else ``None``.
+        """
         if self._stop.is_set():
-            raise StopSim
+            return False
         if t % self._steps_per_frame == 0:
             self._ingest()
             self._refresh(render=True)
             self._pace()
+        return None
 
     def _finish(self, text: str, outcome: str) -> None:
         """Record a mission's terminal state + a one-line summary."""

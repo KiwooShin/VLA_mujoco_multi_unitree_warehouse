@@ -5,17 +5,19 @@ Isolates every MuJoCo/EGL/rendering concern behind :class:`SimEngine` so
 a lightweight fake. The real :class:`MujocoFleetEngine` drives the *public*
 surface of :class:`code.fleet.mission.MissionRunner` only:
 
+* ``reset()`` builds ONE long-lived ``MissionRunner`` (reusing the four
+  ``WBCTeacher`` walk policies); it is never rebuilt per mission,
 * ``submit(text)`` starts a mission; ``run(max_steps, on_step)`` drives it to a
-  terminal outcome while our ``on_step`` renders/paces/aborts,
-* a **fresh** ``MissionRunner`` is built per mission (reusing the four
-  ``WBCTeacher`` walk policies, the tested :mod:`code.fleet.mission_eval`
-  pattern), because one runner handles exactly one mission — its ``submit``
-  guard and transcript-scanning done-check make instance reuse unsafe,
+  terminal outcome while our ``on_step`` renders/paces and may return ``False``
+  to cancel promptly (the public stop contract),
+* ``reset_mission()`` clears the runner's per-mission state between orders (the
+  lifecycle API), so successive orders run on the same fleet in a continuous
+  world — no per-mission rebuild, no ``StopSim`` workaround,
 * between missions the fleet is stepped via ``Fleet.step_all`` so idle robots
   stand in the live BEV.
 
-No state in ``code/fleet`` is mutated; the engine only reads public accessors
-and renders the shared viz model.
+No state in ``code/fleet`` is mutated beyond the public lifecycle calls; the
+engine only reads public accessors and renders the shared viz model.
 """
 
 from __future__ import annotations
@@ -25,10 +27,6 @@ import dataclasses
 from typing import Callable, List, Optional, Sequence
 
 from code.apps.fleet_web.status import RobotSnap
-
-
-class StopSim(Exception):
-    """Raised from a step hook to abort the active mission run promptly."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -50,19 +48,26 @@ class SimEngine(abc.ABC):
 
     @abc.abstractmethod
     def reset(self) -> None:
-        """(Re)build the world so robots stand idle at their home bays."""
+        """Build the long-lived world so robots stand idle at their home bays."""
+
+    def reset_mission(self) -> None:
+        """Clear per-mission state so the next order runs on the same fleet.
+
+        The lifecycle counterpart of :meth:`reset`: reuses the built world (no
+        rebuild). The default is a no-op for trivial fakes that carry no state.
+        """
 
     @abc.abstractmethod
     def submit(self, text: str) -> None:
         """Begin a mission from an already-validated order."""
 
     @abc.abstractmethod
-    def run_mission(self, on_step: Callable[[int], None], max_steps: int) -> str:
+    def run_mission(self, on_step: Callable[[int], object], max_steps: int) -> str:
         """Drive the active mission to a terminal outcome.
 
-        Calls ``on_step(t)`` after each sim step (it may raise
-        :class:`StopSim` to abort). Returns an outcome string:
-        ``"complete"`` / ``"failed"`` / ``"timeout"`` / ``"stopped"``.
+        Calls ``on_step(t)`` after each sim step; ``on_step`` returning ``False``
+        cancels the run promptly (the public stop contract). Returns an outcome
+        string: ``"complete"`` / ``"failed"`` / ``"timeout"`` / ``"stopped"``.
         """
 
     @abc.abstractmethod
@@ -106,7 +111,7 @@ _JPEG_QUALITY = 80
 
 
 class MujocoFleetEngine(SimEngine):
-    """The real EGL-backed engine over a fresh-per-mission ``MissionRunner``."""
+    """The real EGL-backed engine over one long-lived ``MissionRunner``."""
 
     def __init__(self, *, seed: int = 0, use_gpu: bool = True,
                  layout_name: str = "hero") -> None:
@@ -150,7 +155,7 @@ class MujocoFleetEngine(SimEngine):
         return objs
 
     def reset(self) -> None:
-        """Build teachers once, then a fresh idle ``MissionRunner``."""
+        """Build teachers + ONE long-lived idle ``MissionRunner`` (once)."""
         from code.apps.warehouse_demo import bev as bevmod
         from code.fleet.mission import MissionRunner
         from code.fleet.viz import BEV_H, BEV_W
@@ -173,30 +178,20 @@ class MujocoFleetEngine(SimEngine):
             self._layout.hall_x, self._layout.hall_y, width=BEV_W, height=BEV_H,
             fovy_deg=float(viz.model.vis.global_.fovy))
 
+    def reset_mission(self) -> None:
+        """Clear the runner's per-mission state for the next order (lifecycle API)."""
+        if self._runner is not None:
+            self._runner.reset_mission()
+
     # -- mission ----------------------------------------------------------
     def submit(self, text: str) -> None:
         self._runner.submit(text)
 
-    def run_mission(self, on_step: Callable[[int], None], max_steps: int) -> str:
-        def _hook(_runner, t: int) -> None:
-            on_step(t)
+    def run_mission(self, on_step: Callable[[int], object], max_steps: int) -> str:
+        def _hook(_runner, t: int) -> object:
+            return on_step(t)  # returning False cancels the run (stop contract)
 
-        try:
-            self._runner.run(max_steps, on_step=_hook)
-        except StopSim:
-            return "stopped"
-        return self._outcome()
-
-    def _outcome(self) -> str:
-        from code.comms.messages import Performative
-
-        outcome = "timeout"
-        for m in self._runner.bus.transcript:
-            if m.performative is Performative.TASK_COMPLETE:
-                return "complete"
-            if m.performative is Performative.TASK_FAILED:
-                outcome = "failed"
-        return outcome
+        return self._runner.run(max_steps, on_step=_hook).outcome
 
     def idle_step(self) -> None:
         self._runner.fleet.step_all()
@@ -238,7 +233,7 @@ class MujocoFleetEngine(SimEngine):
                 cv2.putText(frame, name, (u - 22, v), cv2.FONT_HERSHEY_SIMPLEX,
                             0.55, col, th, cv2.LINE_AA)
         self._pulse += 1
-        tgt = mr.target_xy()
+        tgt = mr.known_target_xy()  # F2: only once a robot has located the object
         if tgt is not None:
             r = 12 + int(4 * abs(np.sin(self._pulse * 0.15)))
             bevmod.draw_marker(frame, cam, tgt, color=(60, 60, 255), radius=r,

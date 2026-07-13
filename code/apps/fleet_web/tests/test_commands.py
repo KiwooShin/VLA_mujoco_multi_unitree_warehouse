@@ -35,6 +35,16 @@ class ValidateCommandTest(unittest.TestCase):
         self.assertTrue(c.ok)
         self.assertTrue(c.is_fleet)
 
+    def test_generic_object_reference(self):  # F4
+        c = self._check("someone bring the object to the destination")
+        self.assertTrue(c.ok)
+        self.assertTrue(c.is_fleet)
+        self.assertEqual(c.target_desc, "object")
+        # A bare imperative with a generic reference is fleet-addressed too.
+        self.assertTrue(self._check("bring the object to destination").ok)
+        # A pronoun needs a fetch verb; an idle instruction stays unresolvable.
+        self.assertFalse(self._check("Alpha, do something useful").ok)
+
     def test_color_only_object(self):
         c = self._check("Bravo, get the red one")
         self.assertTrue(c.ok)

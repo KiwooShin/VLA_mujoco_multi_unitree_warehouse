@@ -11,7 +11,8 @@ import unittest
 from typing import List, Optional, Tuple
 
 from code.comms.bus import MessageBus
-from code.comms.messages import ObjectQuery, Performative, TaskKind, TaskSpec
+from code.comms.messages import (ObjectQuery, Performative, TaskKind, TaskSpec,
+                                 reconstruct_location)
 from code.comms.protocol import RobotProtocol, RobotState
 from code.comms.tests._helpers import FakeActions, FakeClock, pump
 
@@ -193,6 +194,37 @@ class TestScenarioCDelegatedSearch(unittest.TestCase, _NeedToKnowMixin):
         self.assertEqual(fx.alpha.last_result, "complete")
 
 
+class TestF3RelativeReports(unittest.TestCase):
+    """(F3) Sightings are reported relative to the reporter, then reconstructed."""
+
+    def test_report_found_is_relative_and_reconstructs(self) -> None:
+        actions = {
+            "Alpha": FakeActions(),
+            "Bravo": FakeActions(search_location=LOC, find_after_polls=0,
+                                 pose=(-4.0, 2.8), room="storage A"),
+            "Charlie": FakeActions(), "Delta": FakeActions()}
+        fx = _FleetFixture(actions, regions=("north", "middle", "south"))
+        fx.bus.post("user", "Alpha", P.REQUEST_TASK, {"task": _task()})
+        pump(fx.clock, fx.order(CALLSIGNS), 25)
+
+        found = [m for m in fx.bus.transcript if m.performative is P.REPORT_FOUND]
+        self.assertEqual(len(found), 1)
+        pay = found[0].payload
+        # No absolute transmitted; relative fields present + reconstructing to LOC.
+        self.assertNotIn("location", pay)
+        self.assertEqual(pay["reporter_pose"], (-4.0, 2.8))
+        self.assertEqual(pay["room"], "storage A")
+        self.assertEqual(reconstruct_location(pay), LOC)
+        # The owner navigated to the reconstructed absolute position.
+        self.assertEqual(fx.actions["Alpha"].calls("goto"), [LOC])
+        # The transcript renders the exact F3 sentence in the reporter's voice.
+        from code.comms.bus import format_line
+        line = format_line(found[0])
+        self.assertIn("I am robot Bravo, currently in storage A at position "
+                      "(-4.0, 2.8).", line)
+        self.assertIn("away from me.", line)
+
+
 class TestScenarioDBusyReject(unittest.TestCase, _NeedToKnowMixin):
     """(d) A busy peer REJECTs -> owner re-plans onto a reserve peer."""
 
@@ -348,7 +380,8 @@ class TestProtocolMisc(unittest.TestCase):
                    if m.performative is P.REPORT_VISIBILITY]
         self.assertEqual(len(reports), 1)
         self.assertTrue(reports[0].payload["visible"])
-        self.assertEqual(reports[0].payload["location"], LOC)
+        # F3: the report is relative; the absolute is reconstructed by the owner.
+        self.assertEqual(reconstruct_location(reports[0].payload), LOC)
 
 
 if __name__ == "__main__":

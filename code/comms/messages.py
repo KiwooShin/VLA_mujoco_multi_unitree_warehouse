@@ -89,6 +89,16 @@ class ObjectQuery:
         shape = self.shape_name or "object"
         return f"{self.color_name} {shape}" if self.color_name else shape
 
+    @property
+    def is_generic(self) -> bool:
+        """Whether this query is the wildcard "any object" referent (F4).
+
+        A generic query (both fields ``None``) matches every scene object, so a
+        fleet-addressed "bring the object to the destination" resolves to the
+        first object a robot actually finds.
+        """
+        return self.color_name is None and self.shape_name is None
+
 
 # ---------------------------------------------------------------------------
 # TaskSpec
@@ -130,7 +140,10 @@ _REQUIRED_PAYLOAD: Mapping[Performative, Tuple[str, ...]] = MappingProxyType({
     Performative.COMMAND_SEARCH: ("query", "region"),
     Performative.ACCEPT: (),
     Performative.REJECT: ("reason",),
-    Performative.REPORT_FOUND: ("object", "location"),
+    # F3: position reports are relative to the reporter (each robot knows its own
+    # pose exactly). The receiver reconstructs the absolute object position with
+    # ``reconstruct_location`` (reporter_pose + rel_offset); no absolute is sent.
+    Performative.REPORT_FOUND: ("object", "reporter_pose", "rel_offset"),
     Performative.STATUS_UPDATE: ("text",),
     Performative.TASK_COMPLETE: ("text",),
     Performative.TASK_FAILED: ("reason",),
@@ -187,3 +200,53 @@ class Message:
             )
         # Freeze the payload so recipients cannot mutate delivered messages.
         object.__setattr__(self, "payload", MappingProxyType(payload))
+
+
+# ---------------------------------------------------------------------------
+# F3 — relative position reports
+# ---------------------------------------------------------------------------
+def relative_report_payload(
+    reporter_pose: Tuple[float, float], room: str,
+    obj_xy: Tuple[float, float], extra: Optional[Mapping[str, Any]] = None,
+) -> dict:
+    """Build a relative-position report payload (F3).
+
+    A reporting robot knows its own pose exactly, so it reports where the object
+    is *relative to itself* rather than an absolute world position: the receiver
+    reconstructs the absolute position with :func:`reconstruct_location`.
+
+    Args:
+        reporter_pose: The reporter's own world ``(x, y)`` (m).
+        room: The reporter's current named region / room.
+        obj_xy: The object's world ``(x, y)`` (m), as the reporter perceives it.
+        extra: Extra payload fields to merge in (e.g. ``{"query": q}``).
+
+    Returns:
+        A payload dict with ``reporter_pose``, ``room`` and ``rel_offset`` set
+        (plus any ``extra`` fields). No absolute location is included.
+    """
+    rp = (float(reporter_pose[0]), float(reporter_pose[1]))
+    out: dict = dict(extra or {})
+    out["reporter_pose"] = rp
+    out["room"] = str(room)
+    out["rel_offset"] = (float(obj_xy[0]) - rp[0], float(obj_xy[1]) - rp[1])
+    return out
+
+
+def reconstruct_location(payload: Mapping[str, Any]) -> Tuple[float, float]:
+    """Reconstruct an object's absolute ``(x, y)`` from a relative report (F3).
+
+    ``absolute = reporter_pose + rel_offset`` — the protocol always consumes this
+    reconstruction (never a transmitted absolute), so a robot that misplaces its
+    own pose is the only way a report can be wrong.
+
+    Args:
+        payload: A :data:`Performative.REPORT_VISIBILITY` (visible) or
+            :data:`Performative.REPORT_FOUND` payload.
+
+    Returns:
+        The reconstructed absolute world ``(x, y)`` (m).
+    """
+    rp = payload["reporter_pose"]
+    ro = payload["rel_offset"]
+    return (float(rp[0]) + float(ro[0]), float(rp[1]) + float(ro[1]))

@@ -72,11 +72,15 @@ class TestFormatting(unittest.TestCase):
             line, "t=1200 Alpha->Bravo QUERY_VISIBILITY: can you see the red cube?")
 
     def test_report_visibility_lines(self) -> None:
+        # F3: a positive sighting renders the fixed relative-position sentence.
         yes = self._line("Bravo", "Alpha", Performative.REPORT_VISIBILITY,
-                         {"query": self.q, "visible": True, "location": (1.5, 0.0)})
+                         {"query": self.q, "visible": True,
+                          "reporter_pose": (-2.0, 0.5), "room": "storage A",
+                          "rel_offset": (3.5, 4.2)})
         self.assertEqual(
             yes, "t=1200 Bravo->Alpha REPORT_VISIBILITY: "
-                 "yes, I can see the red cube at (1.5, 0.0)")
+                 "I am robot Bravo, currently in storage A at position "
+                 "(-2.0, 0.5). The object is located 3.5 m and 4.2 m away from me.")
         no = self._line("Charlie", "Alpha", Performative.REPORT_VISIBILITY,
                         {"query": self.q, "visible": False})
         self.assertEqual(
@@ -91,10 +95,14 @@ class TestFormatting(unittest.TestCase):
         self.assertIn("stand down — the red cube has been found", cancel)
 
     def test_report_found_line(self) -> None:
+        # F3: REPORT_FOUND also renders the fixed relative-position sentence.
         line = self._line("Bravo", "Alpha", Performative.REPORT_FOUND,
-                          {"object": self.q, "location": (6.5, 4.7)})
+                          {"object": self.q, "reporter_pose": (5.0, 1.0),
+                           "room": "back room", "rel_offset": (1.5, 3.7)})
         self.assertEqual(
-            line, "t=1200 Bravo->Alpha REPORT_FOUND: found the red cube at (6.5, 4.7)")
+            line, "t=1200 Bravo->Alpha REPORT_FOUND: "
+                  "I am robot Bravo, currently in back room at position "
+                  "(5.0, 1.0). The object is located 1.5 m and 3.7 m away from me.")
 
     def test_request_and_fleet_lines(self) -> None:
         task = TaskSpec(TaskKind.FETCH, self.q, "delivery pad", (5.8, -1.0))
@@ -112,7 +120,8 @@ class TestFormatting(unittest.TestCase):
         self.assertEqual(len(self.bus.transcript_lines(last_n=2)), 2)
 
     def test_formatting_is_deterministic(self) -> None:
-        payload = {"query": self.q, "visible": True, "location": (1.5, 0.0)}
+        payload = {"query": self.q, "visible": True, "reporter_pose": (1.5, 0.0),
+                   "room": "middle area", "rel_offset": (2.0, 1.0)}
         a = self._line("Bravo", "Alpha", Performative.REPORT_VISIBILITY, payload)
         b = self._line("Bravo", "Alpha", Performative.REPORT_VISIBILITY, payload)
         self.assertEqual(a, b)

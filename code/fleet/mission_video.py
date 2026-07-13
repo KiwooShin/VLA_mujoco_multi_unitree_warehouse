@@ -32,14 +32,16 @@ if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
 from code.apps.warehouse_demo import bev as bevmod
+from code.comms.messages import Performative
 from code.fleet.mission import MissionRunner
 from code.fleet.viz import BEV_H, BEV_W
 from code.sim.arena_build import COLORS
-from code.warehouse.layout import hero_layout
+from code.warehouse.layout import WarehouseLayout, hero_layout, rooms_layout
 
 Point = Tuple[float, float]
 _DEFAULT_OUT = str(_REPO / "ops" / "phase4")
 _CMAP = dict(COLORS)
+_LAYOUTS = {"hero": hero_layout, "rooms": rooms_layout}
 # Seconds of simulated time per control step (50 Hz control loop) — drives the
 # "sim time" HUD readout.
 _SIM_DT: float = 0.02
@@ -56,6 +58,15 @@ _PANEL_W: int = 360
 _INSET_W: int = 264
 _INSET_H: int = 198
 _INSET_HOLD_STEPS: int = 100
+# F1 — communicating-robot ego insets: size, and how long (sim steps ~ 2 s of
+# video time at 50 Hz control) an exchange keeps a robot's inset lit before it
+# fades out. Peer<->peer performatives that count as an active exchange.
+_COMM_INSET_W: int = 208
+_COMM_INSET_H: int = 156
+_COMM_HOLD_STEPS: int = 100
+_COMM_PERFS = (Performative.QUERY_VISIBILITY, Performative.REPORT_VISIBILITY,
+               Performative.COMMAND_SEARCH, Performative.ACCEPT,
+               Performative.REJECT, Performative.REPORT_FOUND)
 # Max polyline points drawn per robot trail per frame. Trails grow by one point
 # per control step, so drawing every point made overlay time grow linearly per
 # frame (quadratic per mission — profiled at ~87% of render wall time); striding
@@ -75,18 +86,22 @@ _FILLER = (("orange", "cube", 0.24), ("blue", "cylinder", 0.22),
            ("purple", "cube", 0.24), ("cyan", "cylinder", 0.22),
            ("blue", "ball", 0.24))
 
-# Target spot per scenario (hero layout): A visible to Alpha, B visible to a
+# Target spot per (layout, scenario). Hero: A visible to Alpha, B visible to a
 # peer only, C hidden from all (NE alcove) -> full delegated search, D uses the
-# peer-visible spot for a fleet-addressed allocator demo (the path-shortest robot
-# — a peer, not Alpha — wins and executes).
-_SCENARIO_SPOT: Dict[str, int] = {"A": 6, "B": 7, "C": 5, "D": 7}
+# peer-visible spot for a fleet-addressed allocator demo. Rooms: C is the deep
+# back-room corner (the room-to-room exploration story); F4 the generic-command
+# demo (any object, first found wins).
+_SCENARIO_SPOT: Dict[str, Dict[str, int]] = {
+    "hero": {"A": 6, "B": 7, "C": 5, "D": 7, "F4": 7},
+    "rooms": {"A": 4, "B": 5, "C": 8, "D": 5, "F4": 8},
+}
 
 
-def _build_objects(spot: int) -> List[dict]:
-    """Red cube at ``spot`` + distinct fillers elsewhere (hero layout)."""
+def _build_objects(spot: int, layout: WarehouseLayout) -> List[dict]:
+    """Red cube at ``spot`` + distinct fillers elsewhere, for any layout."""
     objs: List[dict] = []
     fi = 0
-    for i, (x, y) in enumerate(hero_layout().object_spots):
+    for i, (x, y) in enumerate(layout.object_spots):
         if i == spot:
             c, s, sz = "red", "cube", 0.24
         else:
@@ -157,7 +172,8 @@ def _line_phrase(msg) -> str:
     """The human phrase half of a transcript line (without the t=/sender prefix)."""
     from code.comms.bus import _phrase
 
-    return f"{msg.performative.name}: {_phrase(msg.performative, msg.payload)}"
+    return (f"{msg.performative.name}: "
+            f"{_phrase(msg.performative, msg.payload, msg.sender)}")
 
 
 def draw_overlay(frame: np.ndarray, cam: bevmod.BevCamera, mr: MissionRunner,
@@ -183,7 +199,9 @@ def draw_overlay(frame: np.ndarray, cam: bevmod.BevCamera, mr: MissionRunner,
             cv2.putText(frame, name, (u - 22, v), cv2.FONT_HERSHEY_SIMPLEX,
                         0.55, col, th, cv2.LINE_AA)
 
-    tgt = mr.target_xy()
+    # F2: no target ring until a robot has actually located the object; then it
+    # sits at the reported position, and rides the carried object once picked up.
+    tgt = mr.known_target_xy()
     if tgt is not None:
         r = 12 + int(4 * abs(np.sin(t * 0.15)))  # gentle pulse
         bevmod.draw_marker(frame, cam, tgt, color=(60, 60, 255), radius=r, z=0.3)
@@ -248,15 +266,89 @@ def draw_detector_inset(frame: np.ndarray, det, step: int, t: int) -> None:
                 (150, 230, 150), 1, cv2.LINE_AA)
 
 
+def _active_comm_robots(mr: MissionRunner, t: int) -> Dict[str, float]:
+    """Robots currently in a peer<->peer message exchange -> border freshness.
+
+    F1: a robot lights up while it is exchanging QUERY/REPORT/COMMAND/ACCEPT
+    (etc.) with a peer, fading over ``_COMM_HOLD_STEPS`` (~2 s of video) after
+    the exchange's last message. Returns ``{callsign: freshness in (0, 1]}`` for
+    both endpoints of every recent exchange; idle robots are absent (hidden).
+    """
+    robots = set(mr.callsigns)
+    fresh: Dict[str, float] = {}
+    for m in mr.bus.transcript:
+        if m.performative not in _COMM_PERFS:
+            continue
+        if m.sender not in robots or m.recipient not in robots:
+            continue  # only robot<->robot exchanges (skip user/allocator traffic)
+        age = t - m.t_step
+        if age < 0 or age > _COMM_HOLD_STEPS:
+            continue
+        f = 1.0 - age / _COMM_HOLD_STEPS
+        for who in (m.sender, m.recipient):
+            fresh[who] = max(fresh.get(who, 0.0), f)
+    return fresh
+
+
+def draw_comm_insets(frame: np.ndarray, viz, mr: MissionRunner,
+                     active: Dict[str, float]) -> None:
+    """Overlay ego-camera insets for the robots currently communicating (F1).
+
+    Each active robot gets a small live ego render (from the shared viz model at
+    its pose) with an EMPHASIZED, glowing border in its accent colour whose
+    brightness/thickness tracks the exchange's freshness; the insets sit in a row
+    along the bottom of the BEV. Non-communicating robots' views are hidden.
+    """
+    import cv2
+
+    names = [cs for cs in mr.callsigns if cs in active]
+    if not names:
+        return
+    h, w = frame.shape[:2]
+    gap = 14
+    total = len(names) * _COMM_INSET_W + (len(names) - 1) * gap
+    x = max(12, (w - total) // 2)
+    y0 = h - _COMM_INSET_H - 34
+    for cs in names:
+        f = active[cs]
+        unit = mr.fleet.units[cs]
+        ego = viz.render_ego(cs, unit.yaw)
+        inset = cv2.resize(cv2.cvtColor(ego, cv2.COLOR_RGB2BGR),
+                           (_COMM_INSET_W, _COMM_INSET_H),
+                           interpolation=cv2.INTER_AREA)
+        frame[y0:y0 + _COMM_INSET_H, x:x + _COMM_INSET_W] = inset
+        accent = _SENDER_BGR.get(cs, (200, 200, 200))
+        # Glow: concentric borders in the accent colour, brightest (thick) when
+        # the exchange is fresh, fading outward and with age.
+        for k in range(4, 0, -1):
+            a = f * (k / 4.0)
+            col = tuple(int(c * (0.35 + 0.65 * a)) for c in accent)
+            pad = 3 + (4 - k) * 3
+            cv2.rectangle(frame, (x - pad, y0 - pad),
+                          (x + _COMM_INSET_W + pad, y0 + _COMM_INSET_H + pad),
+                          col, 2, cv2.LINE_AA)
+        cv2.rectangle(frame, (x, y0), (x + _COMM_INSET_W, y0 + _COMM_INSET_H),
+                      accent, max(2, int(2 + 3 * f)), cv2.LINE_AA)
+        # Title chip.
+        cv2.rectangle(frame, (x, y0 - 20), (x + _COMM_INSET_W, y0), (25, 25, 25), -1)
+        label = f"{cs} ego  (in comms)"
+        cv2.putText(frame, _ascii(label), (x + 6, y0 - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.44, accent, 1, cv2.LINE_AA)
+        x += _COMM_INSET_W + gap
+
+
 def record_mission_video(scenario: str, out_dir: str, *, decimation: int,
                          fps: int, max_steps: int, seed: int,
-                         perception_mode: str = "oracle") -> Optional[str]:
+                         perception_mode: str = "oracle",
+                         layout_name: str = "hero",
+                         command: Optional[str] = None) -> Optional[str]:
     """Run a scenario mission and write the composited MP4. Returns its path."""
     import cv2
 
     os.makedirs(out_dir, exist_ok=True)
-    spot = _SCENARIO_SPOT.get(scenario, 5)
-    mr = MissionRunner(layout=hero_layout(), objects=_build_objects(spot),
+    layout = _LAYOUTS.get(layout_name, hero_layout)()
+    spot = _SCENARIO_SPOT.get(layout_name, {}).get(scenario, 5)
+    mr = MissionRunner(layout=layout, objects=_build_objects(spot, layout),
                        seed=seed, use_gpu=True, search_deadline_steps=max_steps,
                        perception_mode=perception_mode)
     viz = mr.fleet.viz
@@ -264,7 +356,9 @@ def record_mission_video(scenario: str, out_dir: str, *, decimation: int,
     cam = bevmod.fit_bev_camera(mr.layout.hall_x, mr.layout.hall_y,
                                 width=BEV_W, height=BEV_H,
                                 fovy_deg=float(viz.model.vis.global_.fovy))
-    if scenario == "D":
+    if command is not None:
+        mr.submit(command)
+    elif scenario == "D":
         # Fleet-addressed order: the allocator (not the user) chooses the robot.
         mr.submit("someone bring me the red cube")
     else:
@@ -280,6 +374,7 @@ def record_mission_video(scenario: str, out_dir: str, *, decimation: int,
             recent = _recent_confirmation(runner, t)
             if recent is not None:
                 draw_detector_inset(frame, recent[1], recent[0], t)
+        draw_comm_insets(frame, viz, runner, _active_comm_robots(runner, t))  # F1
         panel = render_transcript_panel(runner, frame.shape[0])
         return np.hstack([frame, panel])
 
@@ -309,7 +404,10 @@ def record_mission_video(scenario: str, out_dir: str, *, decimation: int,
 
 def main(argv: Optional[List[str]] = None) -> None:
     ap = argparse.ArgumentParser(description="Flagship collaborative-fetch video")
-    ap.add_argument("--scenario", choices=("A", "B", "C", "D"), default="C")
+    ap.add_argument("--scenario", choices=("A", "B", "C", "D", "F4"), default="C")
+    ap.add_argument("--layout", choices=tuple(_LAYOUTS), default="hero")
+    ap.add_argument("--command", type=str, default=None,
+                    help="override the submitted order (e.g. a generic F4 command)")
     ap.add_argument("--out", type=str, default=_DEFAULT_OUT)
     ap.add_argument("--decimation", type=int, default=4)
     ap.add_argument("--fps", type=int, default=30)
@@ -321,7 +419,8 @@ def main(argv: Optional[List[str]] = None) -> None:
     args = ap.parse_args(argv)
     record_mission_video(args.scenario, args.out, decimation=args.decimation,
                          fps=args.fps, max_steps=args.max_steps, seed=args.seed,
-                         perception_mode=args.perception)
+                         perception_mode=args.perception,
+                         layout_name=args.layout, command=args.command)
 
 
 if __name__ == "__main__":

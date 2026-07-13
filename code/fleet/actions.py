@@ -25,7 +25,9 @@ from typing import List, Optional, Protocol, Sequence, Tuple
 
 from code.comms.messages import ObjectQuery
 from code.comms.protocol import RobotActions
+from code.fleet.search import region_name_for_xy
 from code.fleet.visibility import VisibilityConfig, is_object_visible
+from code.warehouse.layout import WarehouseLayout
 
 XY = Tuple[float, float]
 
@@ -70,7 +72,8 @@ class FleetRobotActions(RobotActions):
                  search_ctrl: _SearchLike, carry: _CarryLike, *,
                  vis_cfg: Optional[VisibilityConfig] = None,
                  perception: Optional[object] = None,
-                 confirm_range_m: float = 7.0) -> None:
+                 confirm_range_m: float = 7.0,
+                 layout: Optional[WarehouseLayout] = None) -> None:
         """Bind the bridge to one robot's world objects.
 
         Args:
@@ -89,6 +92,9 @@ class FleetRobotActions(RobotActions):
                 ``None`` (default), ``can_see`` is the pure geometric oracle.
             confirm_range_m: Max range (m) at which to run the detector confirmer
                 (mirrors ``perception_bridge.CONFIRM_RANGE_M``).
+            layout: The active warehouse layout, so :meth:`report_origin` can name
+                the room this robot is currently standing in (F3). ``None`` falls
+                back to the region-less "the area".
         """
         self.callsign = callsign
         self._unit = unit
@@ -98,6 +104,7 @@ class FleetRobotActions(RobotActions):
         self._vis = vis_cfg or VisibilityConfig()
         self._perception = perception
         self._confirm_range_m = float(confirm_range_m)
+        self._layout = layout
         self.last_plan_ok: Optional[bool] = None
         # Provenance of the most recent successful can_see (for evals/video):
         # "detector" (GROUND_NET confirmed), "oracle_fallback" (oracle-visible but
@@ -149,6 +156,18 @@ class FleetRobotActions(RobotActions):
             return det.world_xy
         self.last_see_source = "oracle_fallback"
         return oracle_xy
+
+    def report_origin(self) -> Tuple[XY, str]:
+        """Return this robot's own ``(x, y)`` pose and current room name (F3).
+
+        The pose is the robot's exactly-known pelvis position; the room is the
+        named region it currently stands in (``room_of`` on a rooms layout, the
+        "north/middle/south area" third on the hero hall).
+        """
+        xy = (float(self._unit.xy[0]), float(self._unit.xy[1]))
+        room = (region_name_for_xy(self._layout, xy)
+                if self._layout is not None else "the area")
+        return (xy, room)
 
     # -- navigation -------------------------------------------------------
     def goto(self, xy: XY) -> None:

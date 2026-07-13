@@ -40,8 +40,33 @@ def _describe(obj: Any) -> str:
     return describe() if callable(describe) else str(obj)
 
 
-def _phrase(perf: Performative, payload: Mapping[str, Any]) -> str:
-    """Return the human caption phrase for one message's performative + payload."""
+def _report_sentence(sender: str, payload: Mapping[str, Any]) -> str:
+    """Render the F3 fixed relative-position report sentence.
+
+    The exact, user-mandated wording (docs/final_demo_spec.md F3): the reporter
+    names itself and its room, states its own exact position, and gives the
+    object's offset *relative to itself* (dx, dy) — the receiver reconstructs
+    the absolute position from ``reporter_pose + rel_offset``.
+    """
+    rp = payload.get("reporter_pose", (0.0, 0.0))
+    ro = payload.get("rel_offset", (0.0, 0.0))
+    room = payload.get("room", "the area")
+    name = sender or "?"
+    return (f"I am robot {name}, currently in {room} at position "
+            f"({float(rp[0]):.1f}, {float(rp[1]):.1f}). The object is located "
+            f"{float(ro[0]):.1f} m and {float(ro[1]):.1f} m away from me.")
+
+
+def _phrase(perf: Performative, payload: Mapping[str, Any],
+            sender: str = "") -> str:
+    """Return the human caption phrase for one message's performative + payload.
+
+    Args:
+        perf: The message performative.
+        payload: The message payload.
+        sender: The message sender's name, used to render the F3 relative
+            position-report sentence in the reporter's own voice.
+    """
     if perf is Performative.REQUEST_TASK:
         return _describe(payload.get("task"))
     if perf is Performative.QUERY_VISIBILITY:
@@ -49,7 +74,7 @@ def _phrase(perf: Performative, payload: Mapping[str, Any]) -> str:
     if perf is Performative.REPORT_VISIBILITY:
         what = _describe(payload.get("query"))
         if payload.get("visible"):
-            return f"yes, I can see the {what} at {_xy(payload.get('location'))}"
+            return _report_sentence(sender, payload)  # F3 relative report
         return f"no, I can't see the {what}"
     if perf is Performative.COMMAND_SEARCH:
         what = _describe(payload.get("query"))
@@ -62,8 +87,7 @@ def _phrase(perf: Performative, payload: Mapping[str, Any]) -> str:
     if perf is Performative.REJECT:
         return f"can't — {payload.get('reason', 'unavailable')}"
     if perf is Performative.REPORT_FOUND:
-        return (f"found the {_describe(payload.get('object'))} "
-                f"at {_xy(payload.get('location'))}")
+        return _report_sentence(sender, payload)  # F3 relative report
     if perf in (Performative.STATUS_UPDATE, Performative.TASK_COMPLETE):
         return str(payload.get("text", ""))
     if perf is Performative.TASK_FAILED:
@@ -84,7 +108,8 @@ def format_line(msg: Message) -> str:
         ``"t=1200 Alpha->Bravo QUERY_VISIBILITY: can you see the red cube?"``.
     """
     return (f"t={msg.t_step} {msg.sender}->{msg.recipient} "
-            f"{msg.performative.name}: {_phrase(msg.performative, msg.payload)}")
+            f"{msg.performative.name}: "
+            f"{_phrase(msg.performative, msg.payload, msg.sender)}")
 
 
 # ---------------------------------------------------------------------------

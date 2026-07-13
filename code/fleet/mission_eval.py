@@ -40,13 +40,16 @@ if str(_REPO) not in sys.path:
 from code.comms.messages import ObjectQuery
 from code.fleet.allocator import RobotPose, planned_path_length
 from code.fleet.mission import MissionRunner
-from code.fleet.search import SEARCH_REGIONS, free_centroid, region_centroid
+from code.fleet.search import (SEARCH_REGIONS, free_centroid, region_centroid,
+                               region_name_for_xy, search_regions_for_layout)
 from code.fleet.visibility import VisibilityConfig, is_object_visible
 from code.sim.arena_build import COLORS
 from code.sim.teacher import WBCTeacher
-from code.warehouse.layout import CALLSIGNS, WarehouseLayout, hero_layout
+from code.warehouse.layout import (CALLSIGNS, WarehouseLayout, hero_layout,
+                                   rooms_layout)
 
 _DEFAULT_OUT = str(_REPO / "eval" / "missions")
+_LAYOUTS = {"hero": hero_layout, "rooms": rooms_layout}
 Point = Tuple[float, float]
 _CMAP = dict(COLORS)
 _OWNER = "Alpha"
@@ -99,10 +102,12 @@ def build_objects(layout: WarehouseLayout, target_spot: int,
 
 
 def _independent_allocation(layout: WarehouseLayout, cfg: dict,
-                            query: ObjectQuery,
-                            vis: VisibilityConfig) -> Tuple[str, Dict[str, float]]:
+                            query: ObjectQuery, vis: VisibilityConfig,
+                            regions: Tuple[str, ...]
+                            ) -> Tuple[str, Dict[str, float]]:
     """Hand-compute the path-shortest robot (ground truth for class D)."""
     walls = cfg["walls"]
+    rooms = tuple(layout.rooms)
     poses = {cs: RobotPose(layout.spawn_poses[cs][:2], layout.spawn_poses[cs][2], 0.74)
              for cs in CALLSIGNS}
     obj_xy: Optional[Point] = None
@@ -118,10 +123,10 @@ def _independent_allocation(layout: WarehouseLayout, cfg: dict,
         if obj_xy is not None:
             target = obj_xy
         else:
-            best_r = min(SEARCH_REGIONS, key=lambda r: (
-                (region_centroid(r, cfg["hall_x"], cfg["hall_y"])[0] - poses[cs].xy[0]) ** 2
-                + (region_centroid(r, cfg["hall_x"], cfg["hall_y"])[1] - poses[cs].xy[1]) ** 2))
-            target = free_centroid(cfg, best_r)
+            best_r = min(regions, key=lambda r: (
+                (region_centroid(r, cfg["hall_x"], cfg["hall_y"], rooms)[0] - poses[cs].xy[0]) ** 2
+                + (region_centroid(r, cfg["hall_x"], cfg["hall_y"], rooms)[1] - poses[cs].xy[1]) ** 2))
+            target = free_centroid(cfg, best_r, rooms=rooms)
         costs[cs] = planned_path_length(cfg, poses[cs].xy, target)
     winner = min(CALLSIGNS, key=lambda cs: costs[cs])
     return winner, costs
@@ -139,7 +144,8 @@ def run_mission(klass: str, seed: int, layout: WarehouseLayout, spot: int,
                        perception_mode=perception_mode)
     if klass == "D":
         gt_winner, gt_costs = _independent_allocation(
-            layout, mr.scene_cfg, ObjectQuery("red", "cube"), vis)
+            layout, mr.scene_cfg, ObjectQuery("red", "cube"), vis,
+            search_regions_for_layout(layout))
         mr.submit("someone bring me the red cube")
     else:
         gt_winner, gt_costs = "", {}
@@ -193,13 +199,32 @@ def _plan(seeds: int) -> List[Tuple[str, int, int]]:
     return plan
 
 
+def _rooms_plan(seeds: int) -> List[Tuple[str, int, int]]:
+    """Build the (class, seed, spot) plan for the multi-room layout (F6).
+
+    Every rooms spot is hidden from the fleet's bays (all class C), so each
+    searchable-room spot (storage A/B + back room; the fleet's own loading room
+    is not a search target) is one class-C room-to-room search mission. Three
+    fleet-addressed (D) allocations round it out.
+    """
+    layout = rooms_layout()
+    regions = search_regions_for_layout(layout)
+    searchable = [i for i, (x, y) in enumerate(layout.object_spots)
+                  if region_name_for_xy(layout, (x, y)) in regions]
+    plan: List[Tuple[str, int, int]] = [("C", j, spot)
+                                        for j, spot in enumerate(searchable)]
+    for j in range(3):
+        plan.append(("D", 100 + j, searchable[j % len(searchable)]))
+    return plan
+
+
 def run_eval(seeds: int, out_dir: str, max_steps: int,
-             perception_mode: str = "oracle") -> dict:
+             perception_mode: str = "oracle", layout_name: str = "hero") -> dict:
     """Run the full mission suite, write JSON, print the table."""
     os.makedirs(out_dir, exist_ok=True)
-    layout = hero_layout()
+    layout = _LAYOUTS.get(layout_name, hero_layout)()
     teachers = {cs: WBCTeacher(use_gpu=True) for cs in CALLSIGNS}
-    plan = _plan(seeds)
+    plan = _rooms_plan(seeds) if layout.rooms else _plan(seeds)
 
     results: List[dict] = []
     t0 = time.time()
@@ -274,9 +299,11 @@ def main(argv: Optional[List[str]] = None) -> None:
     ap.add_argument("--max-steps", type=int, default=9000)
     ap.add_argument("--perception", choices=("oracle", "groundnet"),
                     default="oracle", help="visibility backend for can_see")
+    ap.add_argument("--layout", choices=tuple(_LAYOUTS), default="hero",
+                    help="hero thirds or the multi-room rooms_layout (F6)")
     args = ap.parse_args(argv)
     run_eval(args.seeds, args.out, args.max_steps,
-             perception_mode=args.perception)
+             perception_mode=args.perception, layout_name=args.layout)
 
 
 if __name__ == "__main__":

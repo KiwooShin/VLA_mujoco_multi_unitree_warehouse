@@ -26,6 +26,21 @@ class TestResolveQuery(unittest.TestCase):
     def test_unresolvable(self) -> None:
         self.assertIsNone(resolve_query("do something useful"))
 
+    def test_generic_object_reference(self) -> None:  # F4
+        # "the object" / "an object" resolve to the wildcard query (any object).
+        for body in ("bring the object to the destination",
+                     "bring the object to destination",
+                     "fetch an object", "carry the item over"):
+            q = resolve_query(body)
+            self.assertIsNotNone(q, body)
+            self.assertTrue(q.is_generic, body)
+        # A bare pronoun only counts with a fetch verb.
+        self.assertTrue(resolve_query("bring me something").is_generic)
+        self.assertIsNone(resolve_query("do something useful"))
+        # A specific colour/shape still wins over the generic path.
+        self.assertEqual(resolve_query("bring the red object"),
+                         ObjectQuery("red", None))
+
 
 class TestDeliveryXy(unittest.TestCase):
     def test_delivery_pad_from_layout(self) -> None:

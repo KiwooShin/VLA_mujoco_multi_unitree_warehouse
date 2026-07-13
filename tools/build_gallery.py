@@ -7,7 +7,10 @@ committed gallery deliverables in ``assets/gallery/``:
   crf ~28, each < 8 MB;
 * ``*_poster.png``  — the single best frame of each clip;
 * ``hero_reel.mp4`` — the four clips concatenated behind 1 s title cards that name
-  each segment, letterboxed to one canonical size, < 20 MB.
+  each segment, letterboxed to one canonical size, < 20 MB;
+* ``mission_c.gif`` — a short (~16 s), palette-optimized GIF of the story-dense
+  fetch-and-carry tail of the mission-C clip, for inline motion in the README
+  (GitHub can't autoplay committed MP4s); < 10 MB.
 
 Uses the libx264-enabled ffmpeg bundled with ``imageio-ffmpeg`` (the base ffmpeg on
 this host lacks libx264).
@@ -135,6 +138,37 @@ def build_reel() -> Path:
     return out
 
 
+# Inline-motion GIF: the story-dense tail of the mission-C clip (searchers have
+# fanned out, Bravo reports the find, Alpha walks the long fetch diagonal, picks
+# up the cube and carries it to the pad). Palette-optimized to stay well < 10 MB.
+_GIF_SRC = "mission_C"     # basename in ops/phase5/hero
+_GIF_OUT = "mission_c.gif"
+_GIF_SS, _GIF_DUR = 40.0, 16.0   # window (seconds) into the source clip
+_GIF_W, _GIF_FPS = 760, 12       # output width (px) and frame rate
+
+
+def make_gif() -> Path:
+    """Render the inline-motion GIF via a two-pass palettegen/paletteuse.
+
+    A per-clip optimized 256-colour palette (``palettegen``) plus rectangle-diff
+    ``paletteuse`` keeps the flat-shaded warehouse render crisp at a fraction of
+    a naive GIF's size.
+    """
+    src = _HERO / f"{_GIF_SRC}.mp4"
+    palette = _TMP / "mission_c_palette.png"
+    out = _GALLERY / _GIF_OUT
+    scale = f"scale={_GIF_W}:-1:flags=lanczos"
+    _run([_FFMPEG, "-y", "-ss", f"{_GIF_SS}", "-t", f"{_GIF_DUR}", "-i", str(src),
+          "-vf", f"fps={_GIF_FPS},{scale},palettegen=stats_mode=diff",
+          str(palette), "-loglevel", "error"])
+    _run([_FFMPEG, "-y", "-ss", f"{_GIF_SS}", "-t", f"{_GIF_DUR}", "-i", str(src),
+          "-i", str(palette),
+          "-lavfi", f"fps={_GIF_FPS},{scale}[x];"
+                    "[x][1:v]paletteuse=dither=bayer:bayer_scale=3:diff_mode=rectangle",
+          str(out), "-loglevel", "error"])
+    return out
+
+
 def _size_mb(path: Path) -> float:
     return path.stat().st_size / 1e6
 
@@ -148,6 +182,8 @@ def main() -> None:
         print(f"[gallery] {clip.name}: {_size_mb(clip):.2f} MB  poster {pos.name}")
     reel = build_reel()
     print(f"[gallery] {reel.name}: {_size_mb(reel):.2f} MB")
+    gif = make_gif()
+    print(f"[gallery] {gif.name}: {_size_mb(gif):.2f} MB")
 
 
 if __name__ == "__main__":

@@ -161,3 +161,29 @@ Hardening backlog (from planner adversarial review, 2026-07-12):
   hand. Document the assumption prominently in README/demos.
 - VR-1 release rule: before any push that claims a working command, run that
   command end-to-end from a fresh clone.
+
+## 7. STATUS — complete (2026-07-12)
+
+All six phases landed; this section is the finished record. Numbers are from the
+released run on the fixed hero layout (artifacts under `eval/`).
+
+| Phase | Deliverable | Status | Evidence |
+|---|---|---|---|
+| 0 | Infra: watchdog, progress log, baseline suite green in new repo | ✅ 07-12 | 1039 baseline tests OK with externals symlinked |
+| 1 | Warehouse arena + walls + 1 robot A\*-navigating it | ✅ 07-12 | nav **10/10** (20/20 2nd seed), 0 falls, path eff **1.00**, A\* ~22 ms |
+| 2 | 4 named robots co-simulated, per-robot policy/perception | ✅ 07-12 | fleet nav **5/5** all-arrive, 0 falls; cross-visibility proven; 4-robot step 2.2–3.1 ms |
+| 3 | Message bus + addressed comms protocols | ✅ 07-12 | need-to-know enforced structurally; deterministic (PYTHONHASHSEED-stable) tests |
+| 4 | Collaborative search + fetch (mock pickup) | ✅ 07-12 | missions A/B/C **30/30** (10 seeds), allocator D **3/3** optimal, 0 falls; same-seed transcript byte-identical |
+| 5 | Hero videos + README + gallery + fresh-clone repro | ✅ 07-12 | gallery MP4s/posters/GIF committed; flagship render ~55 s; **VR-1 rehearsal passed end-to-end** |
+
+**Final test suite:** 1327 tests OK (7 skip without external assets).
+
+**VR-1 fresh-clone rehearsal (Phase 5b).** Every command the README documents was
+run verbatim in a fresh `git clone`, with only `third_party/` and
+`runs/nx6_heatmap_B/` symlinked in (the documented external-assets step): full
+suite (1327 OK), `mission_eval --seeds 1` (3/3 A-C, 3/3 D, 0 falls),
+`mission_video --scenario C` (complete, on-pad, 0 falls), `fleet_video`
+(4/4 arrive + cross-visibility proof), `fleet_eval --n 1` (1/1), `nav_eval`
+(2/2). All exited 0 and produced their artifacts. The rehearsal also corrected a
+stale README figure (cross-visibility, cited 6.6% pre-art-pass, reproduces ~3.3%
+on the released scene) — exactly the class of drift VR-1 exists to catch.

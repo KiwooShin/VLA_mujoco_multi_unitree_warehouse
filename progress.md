@@ -105,3 +105,109 @@ analysis / performance table).
 | Path efficiency (planned/walked) | 1.00 | pelvis tracks smoothed A* tightly |
 | Plan time | ~22 ms | 160×120 grid, 0.1 m |
 | Sim step | 0.52 ms headless / 18 ms rendered | 50 Hz control budget 20 ms |
+
+---
+
+## 2026-07-12 19:30 — Phases 2, 3, 4 complete (entry 3)
+
+### Done (last ~1.7 h)
+- **Phase 2 (fleet co-sim)**: code/fleet/ — RobotUnit stepwise engine
+  (nav_core refactor, no duplicated loop), Fleet with deadlock-free
+  proximity-pause (1.0/1.2 m hysteresis, callsign priority), shared viz
+  model (prefixed MjSpec attach, kinematic qpos sync, per-robot tint).
+  Cross-visibility PROVEN (6.6% ego pixel diff; robots see each other).
+  fleet_eval 5/5 all-arrive, 0 falls. 4-robot stepping 1.8 ms headless.
+- **Phase 3 (comms)**: code/comms/ — typed performatives, FIFO bus with
+  human-readable transcript, RobotProtocol state machine with need-to-know
+  enforced structurally (helpers can't message user), addressing parser.
+  41 deterministic tests (PYTHONHASHSEED-stable).
+- **Phase 4 (missions)**: code/fleet/ mission layer — geometric visibility
+  oracle (FOV+range+wall LOS), region search (N/M/S thirds, reachable
+  patrols), mock pickup/carry on right_wrist_yaw_link (user-confirmed
+  mechanic), A*-length-optimal allocator, MissionRunner, flagship video
+  with live comms panel. Canonical scenario runs END-TO-END on video.
+- Watchdog caught a real perf issue (117% CPU, GPU 0): root cause was
+  unbounded BEV trail re-projection (86.8% of step cost), NOT sim —
+  fixed (video 38.2→7.1 ms/step; flagship render 11.5 min→55 s).
+- Pushed: 95a47c1 (Phase 2), 3f2fda2 (comms), 55bb8bc (Phase 4).
+
+### Next 2 hours
+- 10-seed mission reliability eval (running in background).
+- **Phase 5a**: warehouse art pass (floor/shelf/lighting per §5b backlog,
+  cosmetics only — geometry frozen) + re-record hero videos + compressed
+  gallery assets (assets/gallery/).
+- **Phase 5b**: recruiter-facing README rewrite + fresh-clone VR-1
+  rehearsal + final push.
+
+### Analysis
+- All 4 mission classes green first try: A (owner sees) 4/4, B (peer sees)
+  4/4, C (delegated search) 4/4, D allocator picks true A*-argmin robot 3/3;
+  0 falls across ~24 missions. Determinism: same-seed scenario-C double run
+  is byte-identical (6,700 steps).
+- Worst-case mission (alcove object) completes at 6,700/9,000 step budget —
+  bounded, no timeout risk at current warehouse scale.
+- Protocol pump + visibility oracle cost is negligible (0.012 ms/robot-step);
+  physics+viz sync 2.64 ms/step for 4 robots → headless missions 2.2 ms/step.
+
+### Performance
+| Metric | Value | Notes |
+|---|---|---|
+| Test suite | 1305 OK (7 skip) | +48 mission tests |
+| Fleet nav (4 robots simultaneous) | 5/5, 0 falls | mean makespan 1257 steps |
+| Missions A/B/C | 12/12 | seeds=4 per class |
+| Allocator correctness (D) | 3/3 | vs independent A* argmin |
+| Falls (all missions) | 0 | ~24 missions |
+| Headless mission step | 2.2 ms | 4 robots + protocol |
+| Flagship video render | 55 s | was 11.5 min pre-fix |
+
+---
+
+## 2026-07-12 20:50 — Release: all 5 phases complete (entry 4)
+
+### Done (last ~1.3 h)
+- **10-seed mission eval**: A/B/C 30/30, allocator 3/3, 0 falls, 177 s.
+- **Adversarial review round 2** (mission layer, 25 agents): 0 findings
+  survived the "matters for current evals" gate, but 7 mechanisms were
+  code-confirmed by reviewers → all 7 fixed (+22 regression tests):
+  TASK_FAILED on owner fall/unreachable goal (no more mission hangs),
+  pickup/search booleans honored (no false TASK_COMPLETE), fallen carrier
+  drops the object, fleet requests queue instead of vanishing, mid-mission
+  submit() raises, DEFAULT_REGIONS aligned, NaN-pose allocator guard.
+  Eval unchanged after fixes (12/12, 3/3, 0 falls); determinism preserved.
+- **Art pass**: root-caused the blue floor (G1 XML checker texture beats
+  geom_rgba) — both model variants now render identical clean industrial
+  look; two-light rig; desaturated pads. Object palette/geometry untouched.
+- **Hero gallery committed**: assets/gallery/ — mission_c/b, fleet_nav,
+  allocator MP4s + posters + hero_reel (1:56) + mission_c.gif (1.8 MB,
+  inline README motion); stale single-robot GIFs removed.
+- **README rewritten** (247 lines, recruiter-first) with honest-assumptions
+  box; docs/multi_plan.md STATUS section appended.
+- **Fresh-clone VR-1 rehearsal PASSED**: every documented command run
+  verbatim in a clean clone — suite 1327 OK / mission_eval / mission_video /
+  fleet_video / fleet_eval / nav_eval all exit 0 with artifacts. One stale
+  README figure caught and corrected (cross-visibility 6.6%→3.3% after the
+  art pass changed ego pixel-diff).
+
+### Next 2 hours
+- Cycle 2 kickoff: (a) real learned perception in the mission loop —
+  per-robot GROUND_NET detector confirmation at close range alongside the
+  geometric oracle (fixes the grounding singleton; strengthens the VLA
+  story); (b) interactive live fleet demo (web UI: type addressed commands,
+  watch fleet + transcript live) — design brief first, then Opus agents.
+
+### Analysis
+- The two-vote adversarial gate is well-calibrated for "ship now" questions
+  but under-weights latent robustness for interactive use; reading the
+  verifier journals (mechanism-confirmed vs impact-refuted) was the right
+  orchestrator move — all 7 "rejected" mechanisms were real and cheap to fix.
+- Release state is reproducible by construction: external assets are two
+  documented symlinks; all headline numbers regenerate from committed CLIs.
+
+### Performance
+| Metric | Value | Notes |
+|---|---|---|
+| Test suite | 1327 OK (7 skip) | +22 robustness tests |
+| Missions (10 seeds × A/B/C) | 30/30 | 0 falls |
+| Allocator optimality | 3/3 | vs A* argmin ground truth |
+| Fresh-clone rehearsal | 6/6 commands pass | VR-1 rule |
+| Gallery footprint | ~7 MB committed | reel 2.8 MB + GIF 1.8 MB |

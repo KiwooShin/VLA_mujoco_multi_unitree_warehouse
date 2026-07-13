@@ -42,9 +42,10 @@ from code.apps.warehouse_demo import bev as bevmod
 from code.fleet.fleet import Fleet
 from code.fleet.viz import BEV_H, BEV_W, FleetViz
 from code.warehouse.arena import warehouse_scene_cfg
-from code.warehouse.layout import CALLSIGNS, hero_layout, rooms_layout
+from code.warehouse.layout import (CALLSIGNS, callsigns_for_layout, hero_layout,
+                                   rooms6_layout, rooms_layout)
 
-_LAYOUTS = {"hero": hero_layout, "rooms": rooms_layout}
+_LAYOUTS = {"hero": hero_layout, "rooms": rooms_layout, "rooms6": rooms6_layout}
 
 Point = Tuple[float, float]
 _DEFAULT_OUT = str(_REPO / "ops" / "phase2")
@@ -57,6 +58,8 @@ ACCENT_BGR: Dict[str, Tuple[int, int, int]] = {
     "Bravo": (224, 90, 40),     # blue
     "Charlie": (40, 205, 238),  # yellow
     "Delta": (210, 60, 158),    # purple
+    "Echo": (189, 204, 26),     # teal (F6 six-robot scale-up)
+    "Foxtrot": (26, 138, 247),  # orange
 }
 
 # A crossing goal assignment (spot indices) that reliably produces an aisle
@@ -70,6 +73,12 @@ _DEMO_GOALS: Dict[str, int] = {"Alpha": 7, "Bravo": 4, "Charlie": 3, "Delta": 6}
 _DEMO_GOALS_BY_LAYOUT: Dict[str, Dict[str, int]] = {
     "hero": _DEMO_GOALS,
     "rooms": {"Alpha": 5, "Bravo": 9, "Charlie": 8, "Delta": 2},
+    # rooms6 (six-robot scale-up): the three west bays (Alpha/Bravo/Charlie) drive
+    # east into storage B / the back room, the three east bays (Delta/Echo/Foxtrot)
+    # drive west into storage A / the back room — every path crosses the hall and
+    # funnels through the doorways, so the proximity pause fires repeatedly.
+    "rooms6": {"Alpha": 6, "Bravo": 11, "Charlie": 7,
+               "Delta": 2, "Echo": 3, "Foxtrot": 10},
 }
 
 
@@ -119,11 +128,12 @@ def record_fleet_video(
 
     os.makedirs(out_dir, exist_ok=True)
     layout = _LAYOUTS.get(layout_name, hero_layout)()
+    callsigns = callsigns_for_layout(layout)  # roster follows the layout's bays
     spots = layout.object_spots
     goals = {cs: (float(spots[i][0]), float(spots[i][1]))
              for cs, i in _DEMO_GOALS_BY_LAYOUT.get(layout_name, _DEMO_GOALS).items()}
-    fleet = Fleet(layout, goals, build_viz=True, seed=seed, locomotion=locomotion,
-                  vla_ckpt=vla_ckpt, vla_device=vla_device)
+    fleet = Fleet(layout, goals, callsigns=callsigns, build_viz=True, seed=seed,
+                  locomotion=locomotion, vla_ckpt=vla_ckpt, vla_device=vla_device)
     viz = fleet.viz
     assert viz is not None
     # The shared viz model is display-only (never stepped); robots roam and
@@ -164,7 +174,7 @@ def record_fleet_video(
             writer.write(f)
         writer.release()
     print(f"[fleet-video] {path}  frames={len(frames)}  "
-          f"arrived={sum(u.done for u in fleet.units.values())}/4 "
+          f"arrived={sum(u.done for u in fleet.units.values())}/{len(fleet.callsigns)} "
           f"pauses={fleet.pause_events} makespan={fleet.makespan}", flush=True)
     return path, fleet
 

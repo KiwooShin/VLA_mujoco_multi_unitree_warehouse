@@ -19,6 +19,8 @@ ACCENT_HEX: Dict[str, str] = {
     "Bravo": "#3a7bd5",    # blue
     "Charlie": "#e8c33a",  # yellow
     "Delta": "#9e4fd0",    # purple
+    "Echo": "#1accbd",     # teal (F6 six-robot scale-up)
+    "Foxtrot": "#f78a1a",  # orange
 }
 DEFAULT_ACCENT: str = "#9aa0a6"
 

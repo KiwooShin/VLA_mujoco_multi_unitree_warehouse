@@ -22,8 +22,10 @@ _CALLSIGNS = ("Alpha", "Bravo", "Charlie", "Delta")
 class FakeEngine(SimEngine):
     """A scripted, deterministic sim engine (no MuJoCo)."""
 
-    def __init__(self, *, mission_steps: int = 6) -> None:
+    def __init__(self, *, mission_steps: int = 6,
+                 callsigns: Sequence[str] = _CALLSIGNS) -> None:
         self.mission_steps = mission_steps
+        self._callsigns = tuple(callsigns)
         self.reset_count = 0
         self.reset_mission_count = 0
         self.idle_steps = 0
@@ -38,7 +40,7 @@ class FakeEngine(SimEngine):
 
     @property
     def callsigns(self) -> Sequence[str]:
-        return _CALLSIGNS
+        return self._callsigns
 
     def reset(self) -> None:
         self.reset_count += 1
@@ -62,7 +64,7 @@ class FakeEngine(SimEngine):
         self._on_pad = False
 
     def submit(self, text: str) -> None:
-        check = validate_command(text, _CALLSIGNS)
+        check = validate_command(text, self._callsigns)
         self._target = check.target_desc
         self._owner = "Bravo" if check.is_fleet else check.recipient
         self._on_pad = False
@@ -102,7 +104,7 @@ class FakeEngine(SimEngine):
 
     def robots(self) -> List[RobotSnap]:
         out: List[RobotSnap] = []
-        for cs in _CALLSIGNS:
+        for cs in self._callsigns:
             owner = cs == self._owner and self.in_mission
             out.append(RobotSnap(
                 name=cs,

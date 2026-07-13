@@ -28,7 +28,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
@@ -45,11 +45,12 @@ from code.fleet.search import (SEARCH_REGIONS, free_centroid, region_centroid,
 from code.fleet.visibility import VisibilityConfig, is_object_visible
 from code.sim.arena_build import COLORS
 from code.sim.teacher import WBCTeacher
-from code.warehouse.layout import (CALLSIGNS, WarehouseLayout, hero_layout,
-                                   rooms_layout)
+from code.warehouse.layout import (CALLSIGNS, WarehouseLayout,
+                                   callsigns_for_layout, hero_layout,
+                                   rooms6_layout, rooms_layout)
 
 _DEFAULT_OUT = str(_REPO / "eval" / "missions")
-_LAYOUTS = {"hero": hero_layout, "rooms": rooms_layout}
+_LAYOUTS = {"hero": hero_layout, "rooms": rooms_layout, "rooms6": rooms6_layout}
 Point = Tuple[float, float]
 _CMAP = dict(COLORS)
 _OWNER = "Alpha"
@@ -103,13 +104,14 @@ def build_objects(layout: WarehouseLayout, target_spot: int,
 
 def _independent_allocation(layout: WarehouseLayout, cfg: dict,
                             query: ObjectQuery, vis: VisibilityConfig,
-                            regions: Tuple[str, ...]
+                            regions: Tuple[str, ...],
+                            callsigns: Sequence[str] = CALLSIGNS
                             ) -> Tuple[str, Dict[str, float]]:
     """Hand-compute the path-shortest robot (ground truth for class D)."""
     walls = cfg["walls"]
     rooms = tuple(layout.rooms)
     poses = {cs: RobotPose(layout.spawn_poses[cs][:2], layout.spawn_poses[cs][2], 0.74)
-             for cs in CALLSIGNS}
+             for cs in callsigns}
     obj_xy: Optional[Point] = None
     for obj in cfg["objects"]:
         if query.matches(obj):
@@ -119,7 +121,7 @@ def _independent_allocation(layout: WarehouseLayout, cfg: dict,
                 obj_xy = oxy
             break
     costs: Dict[str, float] = {}
-    for cs in CALLSIGNS:
+    for cs in callsigns:
         if obj_xy is not None:
             target = obj_xy
         else:
@@ -128,7 +130,7 @@ def _independent_allocation(layout: WarehouseLayout, cfg: dict,
                 + (region_centroid(r, cfg["hall_x"], cfg["hall_y"], rooms)[1] - poses[cs].xy[1]) ** 2))
             target = free_centroid(cfg, best_r, rooms=rooms)
         costs[cs] = planned_path_length(cfg, poses[cs].xy, target)
-    winner = min(CALLSIGNS, key=lambda cs: costs[cs])
+    winner = min(callsigns, key=lambda cs: costs[cs])
     return winner, costs
 
 
@@ -137,19 +139,22 @@ def run_mission(klass: str, seed: int, layout: WarehouseLayout, spot: int,
                 perception_mode: str = "oracle",
                 locomotion: str = "teacher",
                 vla_ckpt: Optional[str] = None,
-                vla_device: Optional[str] = None) -> dict:
+                vla_device: Optional[str] = None,
+                callsigns: Optional[Sequence[str]] = None) -> dict:
     """Run one mission of a class and return its metrics dict."""
+    callsigns = list(callsigns) if callsigns is not None else list(CALLSIGNS)
     objs = build_objects(layout, spot, seed)
     vis = VisibilityConfig()
     t0 = time.time()
     mr = MissionRunner(layout=layout, objects=objs, teachers=teachers,
-                       use_gpu=True, search_deadline_steps=max_steps,
+                       callsigns=callsigns, use_gpu=True,
+                       search_deadline_steps=max_steps,
                        perception_mode=perception_mode, locomotion=locomotion,
                        vla_ckpt=vla_ckpt, vla_device=vla_device)
     if klass == "D":
         gt_winner, gt_costs = _independent_allocation(
             layout, mr.scene_cfg, ObjectQuery("red", "cube"), vis,
-            search_regions_for_layout(layout))
+            search_regions_for_layout(layout), callsigns)
         mr.submit("someone bring me the red cube")
     else:
         gt_winner, gt_costs = "", {}
@@ -205,8 +210,9 @@ def _plan(seeds: int) -> List[Tuple[str, int, int]]:
     return plan
 
 
-def _rooms_plan(seeds: int) -> List[Tuple[str, int, int]]:
-    """Build the (class, seed, spot) plan for the multi-room layout (F6).
+def _rooms_plan(seeds: int, layout: Optional[WarehouseLayout] = None
+                ) -> List[Tuple[str, int, int]]:
+    """Build the (class, seed, spot) plan for a multi-room layout (F6 / rooms6).
 
     Every rooms spot is hidden from the fleet's bays (all class C: full
     room-to-room delegated search), so — mirroring the hero plan's ``3*seeds``
@@ -215,7 +221,7 @@ def _rooms_plan(seeds: int) -> List[Tuple[str, int, int]]:
     loading room is not a search target) with a distinct seed per seed-block. Three
     fleet-addressed (D) allocations round it out.
     """
-    layout = rooms_layout()
+    layout = layout or rooms_layout()
     regions = search_regions_for_layout(layout)
     searchable = [i for i, (x, y) in enumerate(layout.object_spots)
                   if region_name_for_xy(layout, (x, y)) in regions]
@@ -235,15 +241,17 @@ def run_eval(seeds: int, out_dir: str, max_steps: int,
     """Run the full mission suite, write JSON, print the table."""
     os.makedirs(out_dir, exist_ok=True)
     layout = _LAYOUTS.get(layout_name, hero_layout)()
-    teachers = {cs: WBCTeacher(use_gpu=True) for cs in CALLSIGNS}
-    plan = _rooms_plan(seeds) if layout.rooms else _plan(seeds)
+    callsigns = list(callsigns_for_layout(layout))
+    teachers = {cs: WBCTeacher(use_gpu=True) for cs in callsigns}
+    plan = _rooms_plan(seeds, layout) if layout.rooms else _plan(seeds)
 
     results: List[dict] = []
     t0 = time.time()
     for idx, (klass, seed, spot) in enumerate(plan):
         r = run_mission(klass, seed, layout, spot, teachers, max_steps,
                         perception_mode=perception_mode, locomotion=locomotion,
-                        vla_ckpt=vla_ckpt, vla_device=vla_device)
+                        vla_ckpt=vla_ckpt, vla_device=vla_device,
+                        callsigns=callsigns)
         results.append(r)
         with open(os.path.join(out_dir, f"mission_{idx:02d}_{klass}.json"), "w") as f:
             json.dump(r, f, indent=2)

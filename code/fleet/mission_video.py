@@ -36,12 +36,13 @@ from code.comms.messages import Performative
 from code.fleet.mission import MissionRunner
 from code.fleet.viz import BEV_H, BEV_W
 from code.sim.arena_build import COLORS
-from code.warehouse.layout import WarehouseLayout, hero_layout, rooms_layout
+from code.warehouse.layout import (WarehouseLayout, callsigns_for_layout,
+                                   hero_layout, rooms6_layout, rooms_layout)
 
 Point = Tuple[float, float]
 _DEFAULT_OUT = str(_REPO / "ops" / "phase4")
 _CMAP = dict(COLORS)
-_LAYOUTS = {"hero": hero_layout, "rooms": rooms_layout}
+_LAYOUTS = {"hero": hero_layout, "rooms": rooms_layout, "rooms6": rooms6_layout}
 # Seconds of simulated time per control step (50 Hz control loop) — drives the
 # "sim time" HUD readout.
 _SIM_DT: float = 0.02
@@ -50,6 +51,7 @@ _SIM_DT: float = 0.02
 _SENDER_BGR: Dict[str, Tuple[int, int, int]] = {
     "Alpha": (40, 40, 224), "Bravo": (224, 90, 40),
     "Charlie": (40, 205, 238), "Delta": (210, 60, 158),
+    "Echo": (189, 204, 26), "Foxtrot": (26, 138, 247),  # teal, orange (F6)
     "user": (240, 240, 240), "allocator": (150, 230, 150),
 }
 _PANEL_W: int = 360
@@ -94,6 +96,10 @@ _FILLER = (("orange", "cube", 0.24), ("blue", "cylinder", 0.22),
 _SCENARIO_SPOT: Dict[str, Dict[str, int]] = {
     "hero": {"A": 6, "B": 7, "C": 5, "D": 7, "F4": 7},
     "rooms": {"A": 4, "B": 5, "C": 8, "D": 5, "F4": 8},
+    # rooms6 (six-robot): C is the deep back-room NE corner (spot 11) — hidden
+    # from every bay, so all five idle peers are delegated a room to search
+    # (three searchable rooms + two reserve) before the back-room searcher finds it.
+    "rooms6": {"A": 0, "B": 1, "C": 11, "D": 6, "F4": 11},
 }
 
 
@@ -312,17 +318,23 @@ def draw_comm_insets(frame: np.ndarray, viz, mr: MissionRunner,
         return
     h, w = frame.shape[:2]
     gap = 14
-    total = len(names) * _COMM_INSET_W + (len(names) - 1) * gap
-    x = max(12, (w - total) // 2)
-    y0 = h - _COMM_INSET_H - 34
+    # Scale the inset width down so the whole row fits within the frame even when
+    # many robots communicate at once (up to six at N=6): a fixed 208 px inset ran
+    # 6 wide off the 960 px BEV. Height tracks width to preserve the ego aspect.
+    margin = 12
+    avail = w - 2 * margin - (len(names) - 1) * gap
+    iw = min(_COMM_INSET_W, max(96, avail // len(names)))
+    ih = min(_COMM_INSET_H, int(round(iw * _COMM_INSET_H / _COMM_INSET_W)))
+    total = len(names) * iw + (len(names) - 1) * gap
+    x = max(margin, (w - total) // 2)
+    y0 = h - ih - 34
     for cs in names:
         f = active[cs]
         unit = mr.fleet.units[cs]
         ego = viz.render_ego(cs, unit.yaw)
-        inset = cv2.resize(cv2.cvtColor(ego, cv2.COLOR_RGB2BGR),
-                           (_COMM_INSET_W, _COMM_INSET_H),
+        inset = cv2.resize(cv2.cvtColor(ego, cv2.COLOR_RGB2BGR), (iw, ih),
                            interpolation=cv2.INTER_AREA)
-        frame[y0:y0 + _COMM_INSET_H, x:x + _COMM_INSET_W] = inset
+        frame[y0:y0 + ih, x:x + iw] = inset
         accent = _SENDER_BGR.get(cs, (200, 200, 200))
         # Glow: concentric borders in the accent colour, brightest (thick) when
         # the exchange is fresh, fading outward and with age.
@@ -331,16 +343,15 @@ def draw_comm_insets(frame: np.ndarray, viz, mr: MissionRunner,
             col = tuple(int(c * (0.35 + 0.65 * a)) for c in accent)
             pad = 3 + (4 - k) * 3
             cv2.rectangle(frame, (x - pad, y0 - pad),
-                          (x + _COMM_INSET_W + pad, y0 + _COMM_INSET_H + pad),
-                          col, 2, cv2.LINE_AA)
-        cv2.rectangle(frame, (x, y0), (x + _COMM_INSET_W, y0 + _COMM_INSET_H),
+                          (x + iw + pad, y0 + ih + pad), col, 2, cv2.LINE_AA)
+        cv2.rectangle(frame, (x, y0), (x + iw, y0 + ih),
                       accent, max(2, int(2 + 3 * f)), cv2.LINE_AA)
         # Title chip.
-        cv2.rectangle(frame, (x, y0 - 20), (x + _COMM_INSET_W, y0), (25, 25, 25), -1)
+        cv2.rectangle(frame, (x, y0 - 20), (x + iw, y0), (25, 25, 25), -1)
         label = f"{cs} ego  (in comms)"
         cv2.putText(frame, _ascii(label), (x + 6, y0 - 6),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.44, accent, 1, cv2.LINE_AA)
-        x += _COMM_INSET_W + gap
+        x += iw + gap
 
 
 def record_mission_video(scenario: str, out_dir: str, *, decimation: int,
@@ -358,6 +369,7 @@ def record_mission_video(scenario: str, out_dir: str, *, decimation: int,
     layout = _LAYOUTS.get(layout_name, hero_layout)()
     spot = _SCENARIO_SPOT.get(layout_name, {}).get(scenario, 5)
     mr = MissionRunner(layout=layout, objects=_build_objects(spot, layout),
+                       callsigns=callsigns_for_layout(layout),
                        seed=seed, use_gpu=True, search_deadline_steps=max_steps,
                        perception_mode=perception_mode, locomotion=locomotion,
                        vla_ckpt=vla_ckpt, vla_device=vla_device)

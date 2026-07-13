@@ -61,6 +61,8 @@ ACCENT_RGBA: Dict[str, Tuple[float, float, float, float]] = {
     "Bravo": (0.16, 0.34, 0.90, 1.0),
     "Charlie": (0.94, 0.80, 0.10, 1.0),
     "Delta": (0.62, 0.24, 0.82, 1.0),
+    "Echo": (0.10, 0.80, 0.74, 1.0),      # teal (F6 six-robot scale-up)
+    "Foxtrot": (0.97, 0.54, 0.10, 1.0),   # orange
 }
 _DEFAULT_ACCENT: Tuple[float, float, float, float] = (0.30, 0.85, 0.55, 1.0)
 

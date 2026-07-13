@@ -124,5 +124,36 @@ class ServiceLoopTest(unittest.TestCase):
         self.assertTrue(any("blue ball" in m["text"] for m in newer))
 
 
+class SixRobotServiceTest(unittest.TestCase):
+    """The service surfaces six chips and addresses Echo/Foxtrot at N=6."""
+
+    _SIX = ("Alpha", "Bravo", "Charlie", "Delta", "Echo", "Foxtrot")
+
+    def setUp(self):
+        self.engine = FakeEngine(mission_steps=6, callsigns=self._SIX)
+        self.svc = FleetService(self.engine, target_fps=200.0,
+                                steps_per_frame=1, max_steps=50)
+        self.svc.start()
+        self.addCleanup(self.svc.stop)
+        self.assertTrue(_wait_until(
+            lambda: "ready" in self.svc.snapshot_state(0)["status"]))
+
+    def test_six_chips_and_foxtrot_addressing(self):
+        # Idle boot snapshot already shows all six robots.
+        self.assertEqual(len(self.svc.snapshot_state(0)["robots"]), 6)
+        self.assertEqual([r["name"] for r in self.svc.snapshot_state(0)["robots"]],
+                         list(self._SIX))
+        # A newly-known callsign (Foxtrot) is a valid addressee.
+        self.assertTrue(self.svc.submit_command(
+            "Foxtrot, fetch the red cube to the delivery pad")["ok"])
+        self.assertTrue(_wait_until(
+            lambda: self.svc.snapshot_state(0)["mission"]["outcome"] == "complete"))
+        state = self.svc.snapshot_state(0)
+        self.assertEqual(len(state["robots"]), 6)
+        self.assertIn("Foxtrot", {m["sender"] for m in state["transcript"]})
+        # Every chip carries its own accent colour (six distinct).
+        self.assertEqual(len({r["color"] for r in state["robots"]}), 6)
+
+
 if __name__ == "__main__":
     unittest.main()

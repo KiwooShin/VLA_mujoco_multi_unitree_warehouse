@@ -106,6 +106,7 @@ class SimEngine(abc.ABC):
 _ACCENT_BGR = {
     "Alpha": (58, 57, 230), "Bravo": (213, 123, 58),
     "Charlie": (58, 195, 232), "Delta": (208, 79, 158),
+    "Echo": (189, 204, 26), "Foxtrot": (26, 138, 247),  # teal, orange (F6)
 }
 _JPEG_QUALITY = 80
 

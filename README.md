@@ -54,6 +54,14 @@ the multi-room layout on the full learned stack (VLA locomotion + fine-tuned det
 **One-file reel** (all four final segments behind title cards):
 [`assets/gallery/hero_reel.mp4`](assets/gallery/hero_reel.mp4).
 
+**Scales past four robots** — same abstractions, six named robots (Alpha…Foxtrot) in a
+24×16 m four-room hall:
+
+| | |
+|---|---|
+| [![Six-Robot Fleet Navigation](assets/gallery/six_fleet_nav_poster.png)](assets/gallery/six_fleet_nav.mp4) | [![Six-Robot Collaborative Search](assets/gallery/six_mission_c_poster.png)](assets/gallery/six_mission_c.mp4) |
+| **Six-robot fleet navigation** (rooms6, 24×16 m) — Alpha…Foxtrot leave six bays and cross the four-room hall on their own A\* routes through the doorways; mutual-proximity pauses fire; 6/6 arrive, zero falls. | **Six-robot collaborative search** (rooms6, class C) — Alpha queries all five peers, delegates three rooms to three searchers (two held in reserve), Charlie finds the cube in the back room and reports to Alpha, who fetches and delivers; live comms panel. |
+
 <details>
 <summary><b>Earlier milestones</b> — the original hero single-hall layout (teacher locomotion + oracle perception)</summary>
 

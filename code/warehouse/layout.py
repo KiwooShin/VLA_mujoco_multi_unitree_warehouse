@@ -29,16 +29,46 @@ import numpy as np
 # Robot callsigns and their demo accent colours (helmet/pad tint per robot).
 # ---------------------------------------------------------------------------
 CALLSIGNS: Tuple[str, ...] = ("Alpha", "Bravo", "Charlie", "Delta")
+# Six-robot fleet (F6 scale-up): the four hero callsigns plus Echo (teal) and
+# Foxtrot (orange). CALLSIGNS stays a 4-tuple so every default (hero/rooms) path
+# is byte-identical; the six-robot layout/evals/videos opt in via CALLSIGNS6 (or,
+# preferably, :func:`callsigns_for_layout`, which derives the set from a layout's
+# own spawn_poses so nothing hard-codes the roster).
+CALLSIGNS6: Tuple[str, ...] = (
+    "Alpha", "Bravo", "Charlie", "Delta", "Echo", "Foxtrot")
 # Home-bay floor pads: each robot's identity colour, slightly desaturated (moved
 # toward mid-gray) so the pads read as calm industrial floor markings rather than
 # neon on video. Robot torso accents (code.fleet.viz.ACCENT_RGBA) stay vivid so
-# the robots themselves remain easy to track.
+# the robots themselves remain easy to track. Echo (muted teal) and Foxtrot (muted
+# burnt-orange) stay distinguishable from each other, the four hero bays and the
+# object palette (red/yellow/blue/green/orange/purple/cyan) on video.
 _BAY_RGBA: Dict[str, Tuple[float, float, float, float]] = {
     "Alpha": (0.78, 0.30, 0.30, 0.50),    # red
     "Bravo": (0.34, 0.44, 0.78, 0.50),    # blue
     "Charlie": (0.80, 0.72, 0.34, 0.50),  # yellow
     "Delta": (0.56, 0.38, 0.70, 0.50),    # purple
+    "Echo": (0.26, 0.58, 0.52, 0.50),     # teal
+    "Foxtrot": (0.80, 0.50, 0.24, 0.50),  # orange
 }
+
+
+def callsigns_for_layout(layout: "WarehouseLayout") -> Tuple[str, ...]:
+    """Return a layout's robot callsigns in canonical (spawn-bay) order.
+
+    The single source of truth for *which* robots a layout hosts is its
+    ``spawn_poses`` (built in callsign order, so dict insertion order is the
+    canonical roster order). The fleet, evals and videos derive their roster from
+    this instead of hard-coding :data:`CALLSIGNS`, so a six-bay layout naturally
+    yields six robots and the four-bay layouts yield the historical four.
+
+    Args:
+        layout: Any layout with populated ``spawn_poses``.
+
+    Returns:
+        The callsigns in spawn-bay order (e.g. hero -> ``CALLSIGNS``; the
+        six-robot rooms layout -> ``CALLSIGNS6``).
+    """
+    return tuple(layout.spawn_poses.keys())
 
 _PERIM_RGBA: Tuple[float, float, float, float] = (0.74, 0.75, 0.78, 1.0)
 _SHELF_RGBA: Tuple[float, float, float, float] = (0.55, 0.40, 0.24, 1.0)
@@ -691,7 +721,10 @@ def _validate_rooms(rooms: Tuple[Room, ...], half_x: float,
         )
 
 
-def validate_rooms_layout(layout: WarehouseLayout) -> None:
+def validate_rooms_layout(
+    layout: WarehouseLayout, *,
+    divider_lines: Tuple[float, float] = (_SPLIT_Y_S, _SPLIT_Y_N),
+) -> None:
     """Raise ValueError if the multi-room layout violates an invariant.
 
     Checks (mirroring the hero validity contract, minus the single-hall
@@ -703,6 +736,9 @@ def validate_rooms_layout(layout: WarehouseLayout) -> None:
 
     Args:
         layout: Multi-room layout to validate.
+        divider_lines: The two horizontal divider ``y`` lines whose doorway gaps
+            are width-checked (default: the fixed four-room ``rooms_layout``
+            split lines; the six-robot ``rooms6_layout`` passes its own).
 
     Raises:
         ValueError: On the first invariant that fails.
@@ -756,7 +792,7 @@ def validate_rooms_layout(layout: WarehouseLayout) -> None:
                 raise ValueError(f"zone {z.name} overlaps wall {w.name}")
 
     # --- Doorways: every gap in the two horizontal dividers >= 1.8 m. ---
-    for line, tag in ((_SPLIT_Y_S, "south"), (_SPLIT_Y_N, "north")):
+    for line, tag in ((divider_lines[0], "south"), (divider_lines[1], "north")):
         for gw in _divider_gaps(layout, "h", line, -half_x, half_x):
             if gw < _MIN_DOORWAY_M - 1e-6:
                 raise ValueError(
@@ -1137,5 +1173,277 @@ def sample_rooms_layout(rng: np.random.Generator, *, max_attempts: int = 200,
         return layout
     raise RuntimeError(
         f"sample_rooms_layout: no valid+reachable layout in {max_attempts} "
+        f"attempts (seed_tag={seed_tag}); last diagnostics: {diagnostics[-6:]}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Six-robot multi-room layout (F6 scale-up): the same FOUR named rooms as
+# ``rooms_layout`` but scaled to a 24x16 m shell so the loading room fits SIX
+# home bays with clean spacing, with one extra shelf per storage room for
+# occlusion at the larger scale. Six spawn bays (CALLSIGNS6), fourteen object
+# spots, all doorways >= 2.0 m. Everything (fleet/comms/search/allocator) derives
+# its roster from the six spawn_poses, so no code hard-codes "six".
+# ---------------------------------------------------------------------------
+_ROOMS6_HALL_X: float = 24.0
+_ROOMS6_HALL_Y: float = 16.0
+_SPLIT6_Y_S: float = -4.0     # loading room | storage rooms boundary (y)
+_SPLIT6_Y_N: float = 4.0      # storage rooms | back room boundary (y)
+_SPLIT6_X: float = 0.0        # storage A | storage B divider (x)
+_DOOR6_W: float = 2.2         # doorway opening width (>= 2.0 m, per spec)
+_BAY6_X: Tuple[float, ...] = (-10.0, -6.0, -2.0, 2.0, 6.0, 10.0)  # six bays
+_BAY6_Y: float = -6.0         # home-bay / spawn y in the loading room
+
+
+def _rooms6_boxes() -> Tuple[Room, ...]:
+    """Return the four room boxes tiling the 24x16 m six-robot interior.
+
+    Identical family to :func:`_rooms_boxes` (full-width south loading strip,
+    west/east storage quadrants split by a central divider, full-width north back
+    strip) scaled to the larger shell; boxes share edges only (no gaps/overlap).
+    """
+    hx, hy = _ROOMS6_HALL_X / 2.0, _ROOMS6_HALL_Y / 2.0
+    mid_y = (_SPLIT6_Y_S + _SPLIT6_Y_N) / 2.0
+    return (
+        Room("loading room", 0.0, (_SPLIT6_Y_S - hy) / 2.0,
+             hx, (hy + _SPLIT6_Y_S) / 2.0),
+        Room("storage A", (_SPLIT6_X - hx) / 2.0, mid_y,
+             (hx + _SPLIT6_X) / 2.0, (_SPLIT6_Y_N - _SPLIT6_Y_S) / 2.0),
+        Room("storage B", (_SPLIT6_X + hx) / 2.0, mid_y,
+             (hx - _SPLIT6_X) / 2.0, (_SPLIT6_Y_N - _SPLIT6_Y_S) / 2.0),
+        Room("back room", 0.0, (_SPLIT6_Y_N + hy) / 2.0,
+             hx, (hy - _SPLIT6_Y_N) / 2.0),
+    )
+
+
+def _room6_divider_walls() -> List[WallSpec]:
+    """Build the three interior dividers with four >= 2.0 m open doorways.
+
+    Doorways sit at x = +/-6 (the storage-A / storage-B midlines), so each of the
+    six south bays has a clear cross-room route through a doorway; the vertical
+    A|B divider is solid, so A<->B routes run through the loading or back room.
+    """
+    hx = _ROOMS6_HALL_X / 2.0
+    doors = [(_SPLIT6_X - hx / 2.0, _DOOR6_W), (_SPLIT6_X + hx / 2.0, _DOOR6_W)]
+    walls: List[WallSpec] = []
+    walls += _divider_walls("h", _SPLIT6_Y_S, -hx, hx, doors,
+                            height=_PART_H, rgba=_PART_RGBA,
+                            name_prefix="wall_div_s")
+    walls += _divider_walls("h", _SPLIT6_Y_N, -hx, hx, doors,
+                            height=_PART_H, rgba=_PART_RGBA,
+                            name_prefix="wall_div_n")
+    walls += _divider_walls("v", _SPLIT6_X, _SPLIT6_Y_S, _SPLIT6_Y_N, [],
+                            height=_PART_H, rgba=_PART_RGBA,
+                            name_prefix="wall_div_ab")
+    return walls
+
+
+def _room6_shelves() -> List[WallSpec]:
+    """Build six storage shelf blocks (three per storage room) for occlusion.
+
+    One more shelf per storage room than :func:`_room_shelves`, so the larger
+    storage rooms still hide their deep-corner object spots from the doorways.
+    Blocks stay clear of the x = +/-6 doorway corridors and the central A|B lane.
+    """
+    hy = 0.35  # 0.7 m deep, matching the hero/rooms shelves
+    return [
+        # storage A (west; x in [-12, 0])
+        WallSpec(-9.0, 2.0, 1.6, hy, height=1.8, rgba=_SHELF_RGBA, name="shelf_A_nw"),
+        WallSpec(-9.0, -2.0, 1.6, hy, height=1.8, rgba=_SHELF_RGBA, name="shelf_A_sw"),
+        WallSpec(-3.0, 0.0, 1.4, hy, height=1.8, rgba=_SHELF_RGBA, name="shelf_A_c"),
+        # storage B (east; x in [0, 12]) — mirror of storage A
+        WallSpec(9.0, 2.0, 1.6, hy, height=1.8, rgba=_SHELF_RGBA, name="shelf_B_ne"),
+        WallSpec(9.0, -2.0, 1.6, hy, height=1.8, rgba=_SHELF_RGBA, name="shelf_B_se"),
+        WallSpec(3.0, 0.0, 1.4, hy, height=1.8, rgba=_SHELF_RGBA, name="shelf_B_c"),
+    ]
+
+
+def _room6_zones_and_spawns() -> Tuple[
+    List[Zone], Dict[str, Tuple[float, float, float]]
+]:
+    """Build the delivery pad (storage B), six home bays and six spawns.
+
+    Six colour-accented bays span the loading room's south wall at 4 m spacing,
+    each facing +y into the hall; the roster order (CALLSIGNS6) is the layout's
+    single source of truth for who is in the fleet.
+    """
+    zones: List[Zone] = [
+        Zone("delivery", 4.0, -2.0, 1.0, 1.0, _DELIVERY_RGBA),  # 2x2 m, storage B
+    ]
+    spawns: Dict[str, Tuple[float, float, float]] = {}
+    for cs, bx in zip(CALLSIGNS6, _BAY6_X):
+        zones.append(Zone(f"bay_{cs}", bx, _BAY6_Y, 0.8, 0.7, _BAY_RGBA[cs]))
+        spawns[cs] = (bx, _BAY6_Y, math.pi / 2.0)  # facing +y into the loading room
+    return zones, spawns
+
+
+def _room6_object_spots() -> List[Tuple[float, float]]:
+    """Return the 14 object spots spread across all four rooms (six-robot scale).
+
+    Two decoys in the loading room and four spots in each of the three searchable
+    rooms; the deep-corner spots sit behind the storage shelves so they are found
+    only by room-to-room exploration.
+    """
+    return [
+        # loading room (south strip; decoys, not search targets)
+        (-9.5, -5.0), (9.5, -5.0),
+        # storage A (west)
+        (-10.5, 3.0), (-10.5, -3.0), (-2.5, 2.8), (-2.5, -2.8),
+        # storage B (east; near the A|B divider / deep east, clear of the
+        # (4,-2) delivery pad and the x=6 doorway corridor)
+        (10.5, 3.0), (10.5, -3.2), (2.5, 3.0), (2.5, -3.0),
+        # back room (north strip)
+        (-10.5, 6.5), (10.5, 6.5), (-2.5, 6.5), (2.5, 6.5),
+    ]
+
+
+def rooms6_layout() -> WarehouseLayout:
+    """Return the fixed six-robot multi-room warehouse layout (F6 scale-up).
+
+    Geometry: a 24x16 m shell partitioned into the same four named rooms as
+    :func:`rooms_layout` (loading room, storage A, storage B, back room) but
+    scaled up so the loading room fits SIX colour-accented home bays (Alpha,
+    Bravo, Charlie, Delta, Echo, Foxtrot) at 4 m spacing along the south wall.
+    Four 2.2 m doorways connect loading<->A, loading<->B, A<->back and B<->back in
+    a cycle (the A|B divider is solid); each storage room carries three shelf
+    blocks (one more than the four-robot layout) for deep-corner occlusion. The
+    2x2 m green delivery pad sits in storage B; fourteen object spots spread
+    across all four rooms, several hidden behind the shelves.
+
+    Returns:
+        A validated :class:`WarehouseLayout` with ``rooms`` populated and six
+        spawn bays (``CALLSIGNS6`` order).
+
+    Raises:
+        ValueError: If the assembled layout violates an invariant (a bug).
+    """
+    half_x, half_y = _ROOMS6_HALL_X / 2.0, _ROOMS6_HALL_Y / 2.0
+    walls = _perimeter_walls(half_x, half_y)
+    walls += _room6_divider_walls()
+    walls += _room6_shelves()
+    zones, spawns = _room6_zones_and_spawns()
+    layout = WarehouseLayout(
+        hall_x=_ROOMS6_HALL_X, hall_y=_ROOMS6_HALL_Y, walls=walls, zones=zones,
+        spawn_poses=spawns, object_spots=_room6_object_spots(),
+        rooms=_rooms6_boxes(), name="rooms6",
+    )
+    validate_rooms_layout(layout, divider_lines=(_SPLIT6_Y_S, _SPLIT6_Y_N))
+    return layout
+
+
+# Randomized six-robot rooms-family jitter ranges (metres). Same reject-and-
+# resample machinery as :func:`sample_rooms_layout` (the split lines stay fixed so
+# the four room boxes/tiling are preserved; the six home bays stay put so the
+# reachability gate always starts from the same poses), scaled to the 24x16 shell.
+_R6_DOOR_W: Tuple[float, float] = (2.0, 2.4)      # doorway width (>= 2.0 m spec)
+_R6_WDOOR_X: Tuple[float, float] = (-9.0, -3.0)   # west doorway centre (storage A x)
+_R6_EDOOR_X: Tuple[float, float] = (3.0, 9.0)     # east doorway centre (storage B x)
+_R6_SHELF_HX: Tuple[float, float] = (1.2, 1.7)    # shelf half-length along x
+_R6_ASHELF_X: Tuple[float, float] = (-10.5, -7.5)  # storage-A outer shelf cx
+_R6_BSHELF_X: Tuple[float, float] = (7.5, 10.5)   # storage-B outer shelf cx
+_R6_CSHELF_AX: Tuple[float, float] = (-4.5, -2.0)  # storage-A central shelf cx
+_R6_CSHELF_BX: Tuple[float, float] = (2.0, 4.5)   # storage-B central shelf cx
+_R6_NSHELF_Y: Tuple[float, float] = (1.4, 2.8)    # north-of-centre shelf cy band
+_R6_SSHELF_Y: Tuple[float, float] = (-2.8, -1.4)  # south-of-centre shelf cy band
+_R6_CSHELF_Y: Tuple[float, float] = (-0.6, 0.6)   # central shelf cy band
+_R6_DELIV_X: Tuple[float, float] = (2.5, 6.0)     # delivery-pad cx (storage B)
+_R6_DELIV_Y: Tuple[float, float] = (-3.0, 3.0)    # delivery-pad cy (storage B)
+
+
+def _sampled_room6_walls(rng: np.random.Generator) -> List[WallSpec]:
+    """Build perimeter + jittered dividers (4 doorways) + six jittered shelves."""
+    hx = _ROOMS6_HALL_X / 2.0
+    walls = _perimeter_walls(hx, _ROOMS6_HALL_Y / 2.0)
+    for line, prefix in ((_SPLIT6_Y_S, "wall_div_s"), (_SPLIT6_Y_N, "wall_div_n")):
+        gaps = [(_uni(rng, _R6_WDOOR_X), _uni(rng, _R6_DOOR_W)),
+                (_uni(rng, _R6_EDOOR_X), _uni(rng, _R6_DOOR_W))]
+        walls += _divider_walls("h", line, -hx, hx, gaps, height=_PART_H,
+                                rgba=_PART_RGBA, name_prefix=prefix)
+    walls += _divider_walls("v", _SPLIT6_X, _SPLIT6_Y_S, _SPLIT6_Y_N, [],
+                            height=_PART_H, rgba=_PART_RGBA,
+                            name_prefix="wall_div_ab")
+    shelf_specs = (
+        ("shelf_A_nw", _R6_ASHELF_X, _R6_NSHELF_Y),
+        ("shelf_A_sw", _R6_ASHELF_X, _R6_SSHELF_Y),
+        ("shelf_A_c", _R6_CSHELF_AX, _R6_CSHELF_Y),
+        ("shelf_B_ne", _R6_BSHELF_X, _R6_NSHELF_Y),
+        ("shelf_B_se", _R6_BSHELF_X, _R6_SSHELF_Y),
+        ("shelf_B_c", _R6_CSHELF_BX, _R6_CSHELF_Y),
+    )
+    for name, xr, yr in shelf_specs:
+        walls.append(WallSpec(round(_uni(rng, xr), 3), round(_uni(rng, yr), 3),
+                              round(_uni(rng, _R6_SHELF_HX), 3), 0.35,
+                              height=1.8, rgba=_SHELF_RGBA, name=name))
+    return walls
+
+
+def _sampled_room6_zones_and_spawns(
+    rng: np.random.Generator,
+) -> Tuple[List[Zone], Dict[str, Tuple[float, float, float]]]:
+    """Build the jittered delivery pad (storage B) + the fixed six home bays."""
+    zones: List[Zone] = [
+        Zone("delivery", round(_uni(rng, _R6_DELIV_X), 3),
+             round(_uni(rng, _R6_DELIV_Y), 3), 1.0, 1.0, _DELIVERY_RGBA),
+    ]
+    spawns: Dict[str, Tuple[float, float, float]] = {}
+    for cs, bx in zip(CALLSIGNS6, _BAY6_X):
+        zones.append(Zone(f"bay_{cs}", bx, _BAY6_Y, 0.8, 0.7, _BAY_RGBA[cs]))
+        spawns[cs] = (bx, _BAY6_Y, math.pi / 2.0)
+    return zones, spawns
+
+
+def sample_rooms6_layout(rng: np.random.Generator, *, max_attempts: int = 200,
+                         enforce_reachable: bool = True) -> WarehouseLayout:
+    """Return a seeded randomized variant of the six-robot four-room layout.
+
+    Reuses the :func:`sample_rooms_layout` reject-and-resample machinery (the
+    generic :func:`_sampled_room_spots`, :func:`validate_rooms_layout` and the
+    :func:`_all_pairs_reachable` 0.40/0.45 m gate) scaled to the 24x16 m shell:
+    the four room boxes/tiling, the solid A|B divider and the six home bays are
+    fixed; the four doorway centres+widths, the six storage-shelf placements,
+    2-3 object spots per room and the delivery-pad position are randomized.
+    Deterministic given ``rng``.
+
+    Args:
+        rng: Caller-owned NumPy generator; advances state.
+        max_attempts: Cap on full resample attempts before giving up.
+        enforce_reachable: Run the 0.40/0.45 m reachability gate (default True).
+
+    Returns:
+        A validated, plan-reachable :class:`WarehouseLayout` with six spawn bays.
+
+    Raises:
+        RuntimeError: If no valid + reachable layout is found in ``max_attempts``.
+    """
+    rooms = _rooms6_boxes()
+    seed_tag = int(rng.integers(0, 1_000_000))
+    diagnostics: List[str] = []
+    for attempt in range(max_attempts):
+        walls = _sampled_room6_walls(rng)
+        zones, spawns = _sampled_room6_zones_and_spawns(rng)
+        probe = WarehouseLayout(
+            hall_x=_ROOMS6_HALL_X, hall_y=_ROOMS6_HALL_Y, walls=walls, zones=zones,
+            spawn_poses=spawns, object_spots=[], rooms=rooms)
+        spots = _sampled_room_spots(rng, walls, zones[0], rooms, probe)
+        if spots is None:
+            diagnostics.append(f"attempt {attempt}: could not place per-room spots")
+            continue
+        layout = WarehouseLayout(
+            hall_x=_ROOMS6_HALL_X, hall_y=_ROOMS6_HALL_Y, walls=walls, zones=zones,
+            spawn_poses=spawns, object_spots=spots, rooms=rooms,
+            name=f"sample_rooms6_{seed_tag}")
+        try:
+            validate_rooms_layout(layout, divider_lines=(_SPLIT6_Y_S, _SPLIT6_Y_N))
+        except ValueError as e:
+            diagnostics.append(f"attempt {attempt}: invalid geometry: {e}")
+            continue
+        if enforce_reachable:
+            ok, diag = _all_pairs_reachable(layout)
+            if not ok:
+                diagnostics.append(f"attempt {attempt}: unreachable: {diag}")
+                continue
+        return layout
+    raise RuntimeError(
+        f"sample_rooms6_layout: no valid+reachable layout in {max_attempts} "
         f"attempts (seed_tag={seed_tag}); last diagnostics: {diagnostics[-6:]}"
     )

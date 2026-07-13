@@ -357,3 +357,40 @@ User specified final-demo requirements F1-F6 (docs/final_demo_spec.md) at
 | Recovered mission | D seed=102: failed → complete | same-seed proof |
 | Occlusion FP (valid poses) | 0.000 | was 0.262 raw / mislabeled |
 | Test suite | 1489 OK (7 skip) | +39 since release |
+
+---
+
+## 2026-07-13 08:10 — Generalization + confirm-then-report + audit closed (entry 8)
+
+### Done (last ~4 h)
+- **Generalization (4829eb9)**: sample_rooms_layout + reachability-gated
+  hero sampler (fixed: ~31% of ungated draws sealed the alcove);
+  gen_eval CLI; **384 missions on 16 never-seen layouts: learned stack
+  142/144 (98.6%), baseline 144/144, 48/48 allocations**. README table.
+- **Confirm-then-report (20ed9ea)**: root-caused the long-range miss
+  class (22° bearing gate error grows as 0.375·range) — searchers now
+  walk to a 3 m standoff and re-confirm before REPORT_FOUND (bounded;
+  approx=True fallback widens the owner's refine gate). Rooms seed-6:
+  8/9 → 9/9. Mean cost +47 steps/mission.
+- **Final adversarial audit (16-agent workflow, mechanism-holds bar):
+  12 confirmed latent findings, all closed (917649c)** — headline
+  majors were lifecycle bugs in the successive-mission web-demo path
+  (reset_mission now truly idles the fleet; F2 ring can't lock onto the
+  previous mission's delivered object) and the peer-reply sighting path
+  that bypassed confirm-then-report. Oracle mode byte-identical; all
+  evals unchanged; +17 regression tests.
+- Suite: **1516 OK**. Verification matrix: rooms 12/12+3/3, hero
+  6/6+3/3, seed-6 9/9, successive-mission scenarios correct,
+  determinism double-run identical.
+
+### Next
+- 6-robot scale-up demo (Echo/Foxtrot, larger rooms variant) — last
+  big demo win; then space-time reservation planning if green.
+
+### Performance
+| Metric | Value | Notes |
+|---|---|---|
+| Generalization (16 unseen layouts) | 142/144 learned (98.6%) | 144/144 baseline; both misses diagnosed, 1 fixed |
+| Post-fix seed-6 | 9/9 + 3/3, 0 falls | was 8/9 |
+| Audit findings closed | 12/12 | 3 major (lifecycle/peer-reply/ring) |
+| Test suite | 1516 OK (7 skip) | +27 today |

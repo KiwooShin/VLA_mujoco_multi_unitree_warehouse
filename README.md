@@ -39,6 +39,27 @@ right panel is the **live comms transcript** (coloured per speaker) plus the
 **communicating robots' ego insets** (F1). (GitHub can't autoplay committed MP4s —
 this is a compressed clip of the flagship video below.)</sub>
 
+## Demo set (v2)
+
+Six production scenarios in **[`demo/`](demo/)**, each on the **full learned stack**
+(GROUND_NET perception + VLA locomotion) with **random robot start poses**, an
+**always-on ego-camera strip**, a **live comms transcript**, and **clarification
+dialogue** for ambiguous orders. Click a poster to play the MP4; the per-demo
+paragraph stories and inline GIF previews live in
+**[`demo/README.md`](demo/README.md)**.
+
+| | | |
+|---|---|---|
+| [![Ambiguous order → clarify → fetch](demo/clarify_fetch_poster.png)](demo/clarify_fetch.mp4) | [![Exploration on a never-seen map](demo/unseen_map_poster.png)](demo/unseen_map.mp4) | [![Two objects, two owners, in parallel](demo/dual_fetch_poster.png)](demo/dual_fetch.mp4) |
+| **Clarify → fetch** — *"bring me the cube"* → **which cube: red, blue or yellow?** → user answers → delegated room-to-room search. | **Never-seen map** — a freshly **sampled** warehouse; delegated exploration for a shelf-occluded cube. | **Two owners in parallel** — one order **splits into two concurrent missions**, both delivered to the pad. |
+| [![Sequential relay](demo/relay_multigoal_poster.png)](demo/relay_multigoal.mp4) | [![Mid-mission re-task](demo/retask_poster.png)](demo/retask.mp4) | [![Six-robot flagship](demo/six_robot_flagship_poster.png)](demo/six_robot_flagship.mp4) |
+| **Sequential relay** — one owner fetches **two objects in turn**, re-using the same helpers across legs. | **Mid-mission re-task** — the user **changes the order mid-fetch**; the owner aborts and switches targets. | **Six-robot flagship** — the **allocator clarifies** *"a ball"*, assigns an owner, searches with a **reserve**. |
+
+Produced deterministically by
+`python -m code.apps.demos.scenarios.produce_all --all` (per-demo seeds, layouts,
+object placement and clarify/re-task schedules are all fixed in
+`code/apps/demos/scenarios/`).
+
 ## Demo gallery
 
 Click a poster to play the MP4 (`assets/gallery/`). These four **final** clips run in

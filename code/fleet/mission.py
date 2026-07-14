@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+import re
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import mujoco
@@ -27,7 +28,8 @@ import mujoco
 from code.comms.addressing import parse_addressed_instruction
 from code.comms.bus import MessageBus
 from code.comms.messages import (ObjectQuery, Performative, TaskKind, TaskSpec,
-                                 reconstruct_location)
+                                 clarify_options, clarify_question,
+                                 reconstruct_location, refine_query)
 from code.comms.protocol import RobotProtocol, RobotState
 from code.fleet.actions import FleetRobotActions
 from code.fleet.allocator import (AllocationResult, RobotPose, allocate,
@@ -38,7 +40,8 @@ from code.fleet.search import (SearchController, free_centroid,
                                search_regions_for_layout)
 from code.fleet.visibility import VisibilityConfig, is_object_visible
 from code.sim.arena_build import COLORS, SHAPES
-from code.warehouse.layout import CALLSIGNS, WarehouseLayout, hero_layout
+from code.warehouse.layout import (CALLSIGNS, WarehouseLayout, hero_layout,
+                                   sample_spawn_poses)
 
 XY = Tuple[float, float]
 
@@ -90,12 +93,55 @@ def resolve_query(body: str) -> Optional[ObjectQuery]:
     return ObjectQuery(color, shape)
 
 
+def resolve_queries(body: str, sep: str) -> List[ObjectQuery]:
+    """Split an instruction body on ``sep`` and resolve each part to a query.
+
+    Used for sequential multi-goal ("the red cube, then the yellow cylinder",
+    ``sep="then"``) and conjunctive concurrent orders ("the red cube and the blue
+    ball", ``sep="and"``). Parts that resolve to an :class:`ObjectQuery` are kept
+    in order; unresolvable fragments (e.g. a trailing "to the pad") are dropped, so
+    a single-object body collapses to one query and the caller can fall back to
+    the ordinary single-mission path.
+
+    Args:
+        body: The addressee-stripped instruction body.
+        sep: The delimiter word ("then" or "and").
+
+    Returns:
+        The resolved queries, in order (possibly length 1).
+    """
+    parts = re.split(rf"\b{re.escape(sep)}\b|,", body, flags=re.IGNORECASE)
+    out: List[ObjectQuery] = []
+    for part in parts:
+        q = resolve_query(part)
+        if q is not None:
+            out.append(q)
+    return out
+
+
 def delivery_xy(layout: WarehouseLayout) -> Tuple[str, XY]:
     """Return the delivery pad's ``(name, (x, y))`` from a layout."""
     for z in layout.zones:
         if z.name == "delivery":
             return ("delivery pad", (float(z.cx), float(z.cy)))
     return ("delivery pad", (0.0, 0.0))
+
+
+@dataclasses.dataclass
+class _MissionCtx:
+    """Per-mission state for concurrent (two-owner) missions.
+
+    A single mission uses the runner's flat ``task``/``primary_owner``/target
+    fields (byte-identical legacy path); concurrent missions each carry one of
+    these so the two owners' targets, F2 rings and terminal detection stay
+    per-mission and never bleed into one another.
+    """
+
+    task: TaskSpec
+    owner: Optional[str] = None            # allocated searcher-owner (None until assigned)
+    reported_target: Optional[XY] = None   # first located position (F2 ring)
+    target_index: Optional[int] = None     # locked object index once picked up
+    scan_base: int = 0                     # transcript index to scan sightings from
 
 
 # ---------------------------------------------------------------------------
@@ -137,7 +183,10 @@ class MissionRunner:
                  locomotion: str = "teacher",
                  vla_ckpt: Optional[str] = None,
                  vla_device: Optional[str] = None,
-                 reservations: bool = False) -> None:
+                 reservations: bool = False,
+                 spawn_poses: Optional[Dict[str, Tuple[float, float, float]]] = None,
+                 spawn_seed: Optional[int] = None,
+                 clarify_deadline_steps: int = 400) -> None:
         """Build the fleet, bus, per-robot protocols/bridges and carry manager.
 
         Args:
@@ -168,13 +217,39 @@ class MissionRunner:
             reservations: F7 proactive space-time reservation routing in the
                 fleet (default False). Searchers replan often, so every replan
                 releases + rebooks; the proximity pause stays the safety net.
+            spawn_poses: Demo v2 random-start override — an explicit
+                ``callsign -> (x, y, yaw)`` map replacing the layout's home bays.
+                Takes precedence over ``spawn_seed``.
+            spawn_seed: Demo v2 random-start seed — sample deterministic,
+                spaced, reachability-checked free poses via
+                :func:`~code.warehouse.layout.sample_spawn_poses`. With random
+                spawns on a rooms layout every room becomes searchable (the fixed
+                home-bay room is no longer excluded).
+            clarify_deadline_steps: Steps a robot/allocator waits for the user's
+                CLARIFY answer before failing the task ("need clarification").
         """
         self.layout = layout or hero_layout()
         self.callsigns: List[str] = list(callsigns)
         self._vis = vis_cfg or VisibilityConfig()
-        # F6: search regions follow the layout unless the caller pins them.
-        self._regions = (tuple(regions) if regions is not None
-                         else search_regions_for_layout(self.layout))
+        # Demo v2 random spawns: override the layout's home-bay start poses. Done
+        # BEFORE regions/scene/fleet are derived so everything sees the new poses.
+        self._random_spawns = spawn_poses is not None or spawn_seed is not None
+        if self._random_spawns:
+            if spawn_poses is None:
+                spawn_poses = sample_spawn_poses(self.layout, self.callsigns,
+                                                 seed=int(spawn_seed),
+                                                 objects=objects)
+            self.layout = dataclasses.replace(self.layout,
+                                              spawn_poses=dict(spawn_poses))
+        # F6: search regions follow the layout unless the caller pins them. With
+        # random spawns on a rooms layout no room is excluded (the robots no
+        # longer hold the fixed home-bay room), so every room is searchable.
+        if regions is not None:
+            self._regions = tuple(regions)
+        elif self._random_spawns and self.layout.rooms:
+            self._regions = tuple(r.name for r in self.layout.rooms)
+        else:
+            self._regions = search_regions_for_layout(self.layout)
         self._rooms = tuple(self.layout.rooms)
         self.perception_mode = perception_mode
         self.locomotion = locomotion
@@ -234,6 +309,7 @@ class MissionRunner:
                 cs, self.bus, act, peers, search_regions=self._regions,
                 reply_deadline_steps=reply_deadline_steps,
                 search_deadline_steps=search_deadline_steps,
+                clarify_deadline_steps=clarify_deadline_steps,
                 region_assigner=assigner)
 
         self._t = 0
@@ -254,6 +330,24 @@ class MissionRunner:
         # drain, queued-once notice sent, failed if still unassigned at budget end.
         self._pending_fleet: List[TaskSpec] = []
         self._fleet_queued_notified = False
+        self._clarify_deadline_steps = int(clarify_deadline_steps)
+
+        # -- Demo v2 dialogue / concurrency / re-task state -------------------
+        # Scripted-user CLARIFY answers, consumed in order (submit(replies=...)).
+        self._user_replies: List[str] = []
+        # Scheduled mid-mission re-tasks: (at_step, text), fired once at at_step.
+        self._scheduled_retasks: List[Tuple[int, str]] = []
+        # Allocator-side clarification for a SINGLE fleet order (F: the allocator,
+        # not a robot, asks the user which object a "someone bring me ..." means).
+        self._alloc_clarifying = False
+        self._alloc_clarify_deadline = 0
+        # Deferred-target scan base + last owner query, so the F2 ring re-defers to
+        # a fresh sighting on each sequential leg / re-task (single-mission path).
+        self._target_scan_base = 0
+        self._last_owner_query: Optional[ObjectQuery] = None
+        # Concurrent (two-owner) missions; empty for the single-mission path.
+        self._concurrent = False
+        self._missions: List[_MissionCtx] = []
 
     # -- perception (groundnet mode) --------------------------------------
     def _build_perceptions(self) -> None:
@@ -380,12 +474,21 @@ class MissionRunner:
         self._reported_target = None
         self._target_index = None
         self._cancelled = False
+        # Demo v2 dialogue / concurrency / re-task bookkeeping.
+        self._user_replies = []
+        self._scheduled_retasks = []
+        self._alloc_clarifying = False
+        self._alloc_clarify_deadline = 0
+        self._last_owner_query = None
+        self._concurrent = False
+        self._missions = []
         self.trails = {c: [] for c in self.callsigns}
         # Heavy DetectionResult payloads (a full grounding RGB frame + heatmap
         # each): never carry a prior mission's confirmations into the next one
         # (unbounded growth + cumulative n_confirmations on a reused runner).
         self.confirmations = []
         self._mission_base = len(self.bus.transcript)
+        self._target_scan_base = self._mission_base
         self._submitted = 0
         # Make the fleet ACTUALLY idle. A non-terminal (timeout/stopped) mission
         # end can leave a protocol mid-flight (OWNER_NAVIGATING/DELEGATING, or a
@@ -417,7 +520,7 @@ class MissionRunner:
                 "reset_mission could not return all robots to idle; a mission "
                 "may still be in flight")
 
-    def submit(self, text: str) -> TaskSpec:
+    def submit(self, text: str, replies: Optional[Sequence[str]] = None) -> TaskSpec:
         """Parse and post a natural-language order onto the bus.
 
         A :class:`MissionRunner` runs one mission at a time, but the same runner
@@ -426,11 +529,24 @@ class MissionRunner:
         Submitting while a mission is still in flight is rejected (it would
         clobber the active task and owner attribution).
 
+        Handles three shapes of single-owner order:
+
+        * a plain fetch ("Alpha, fetch the red cube to the delivery pad");
+        * an ambiguous fetch ("bring me the cube") — the recipient asks the user
+          which object (CLARIFY), and ``replies`` supplies the scripted answers;
+        * a sequential multi-goal ("Alpha, bring the red cube, then the yellow
+          cylinder") — the owner fetches each leg in turn (TASK_COMPLETE only
+          after the last), passed to the protocol as REQUEST_TASK ``legs``.
+
         Args:
             text: The raw order (addressed to a callsign or the fleet).
+            replies: Scripted user answers to any CLARIFY this mission raises,
+                consumed in order (each time a CLARIFY reaches the user). An
+                empty/exhausted list leaves an ambiguous order to fail on the
+                clarify deadline ("need clarification").
 
         Returns:
-            The resolved :class:`TaskSpec`.
+            The resolved first-leg :class:`TaskSpec`.
 
         Raises:
             ValueError: If no object can be resolved from the order.
@@ -443,21 +559,160 @@ class MissionRunner:
         if self._submitted > 0:
             self.reset_mission()  # a previous mission finished — start clean
         self._mission_base = len(self.bus.transcript)
+        self._target_scan_base = self._mission_base
+        self._user_replies = list(replies or [])
         addr = parse_addressed_instruction(text, self.callsigns)
-        query = resolve_query(addr.body)
+        # Sequential multi-goal: "<A>, then <B>[, then <C>]" -> ordered legs.
+        legs = resolve_queries(addr.body, "then") if re.search(
+            r"\bthen\b", addr.body, re.IGNORECASE) else []
+        query = legs[0] if legs else resolve_query(addr.body)
         if query is None:
             raise ValueError(f"could not resolve an object from {addr.body!r}")
         task = TaskSpec(TaskKind.FETCH, query, self._dest_name, self._dest_xy,
                         requester="user")
         self.task = task
+        payload: Dict[str, object] = {"task": task}
+        if len(legs) > 1:
+            payload["legs"] = tuple(
+                TaskSpec(TaskKind.FETCH, q, self._dest_name, self._dest_xy,
+                         requester="user")
+                for q in legs[1:])
         if addr.is_fleet:
             self.bus.post("user", "fleet", Performative.FLEET_REQUEST, {"task": task})
         else:
             self.primary_owner = addr.recipient
-            self.bus.post("user", addr.recipient, Performative.REQUEST_TASK,
-                          {"task": task})
+            self.bus.post("user", addr.recipient, Performative.REQUEST_TASK, payload)
         self._submitted += 1
         return task
+
+    def submit_multi(self, text: str,
+                     replies: Optional[Sequence[str]] = None) -> List[TaskSpec]:
+        """Split a conjunctive fleet order into TWO concurrent missions.
+
+        "bring the red cube and the blue ball to the pad" becomes two
+        independently-owned fetch missions that run the standard protocol in
+        parallel: the allocator assigns each a distinct owner, and each owner
+        delegates only to robots not already owned by / assisting the other
+        (need-to-know stays intact — owner A never learns owner B's find). The
+        run terminates when BOTH missions reach a terminal outcome.
+
+        Args:
+            text: A conjunctive fleet order ("... X and Y ...").
+            replies: Scripted CLARIFY answers (rarely needed — conjunctive demo
+                orders are specific), shared across both owners in arrival order.
+
+        Returns:
+            The per-mission first :class:`TaskSpec`\\ s (one per conjunct).
+
+        Raises:
+            ValueError: If fewer than two objects can be resolved.
+            RuntimeError: If a mission is already in progress on this runner.
+        """
+        if self._mission_active():
+            raise RuntimeError("a mission is already in progress on this runner")
+        if self._submitted > 0:
+            self.reset_mission()
+        self._mission_base = len(self.bus.transcript)
+        self._target_scan_base = self._mission_base
+        self._user_replies = list(replies or [])
+        addr = parse_addressed_instruction(text, self.callsigns)
+        queries = resolve_queries(addr.body, "and")
+        if len(queries) < 2:
+            raise ValueError(
+                f"submit_multi needs two objects; resolved {len(queries)} from "
+                f"{addr.body!r}")
+        tasks = [TaskSpec(TaskKind.FETCH, q, self._dest_name, self._dest_xy,
+                          requester="user") for q in queries]
+        self._concurrent = True
+        self._missions = [_MissionCtx(task=t, scan_base=self._mission_base)
+                          for t in tasks]
+        self.task = tasks[0]  # legacy single-field mirror (introspection back-compat)
+        # Post one fleet request per conjunct so both orders read in the transcript;
+        # the concurrent allocator drains and allocates them to distinct owners.
+        for t in tasks:
+            self.bus.post("user", "fleet", Performative.FLEET_REQUEST, {"task": t})
+        self._submitted += 1
+        return tasks
+
+    def retask(self, text: str, at_step: int) -> None:
+        """Schedule a mid-mission order change to fire at control step ``at_step``.
+
+        When the step arrives the CURRENT owner is redirected onto the new
+        referent (F: mid-mission re-task): it stands down any helpers, abandons
+        its current approach/search, re-resolves the new object (clarifying again
+        if the new referent is ambiguous — answers still come from ``replies``),
+        and proceeds to fetch it. The old target's F2 ring clears and the mission
+        result reflects the FINAL task. Scripted, like ``submit(replies=...)``:
+        register it before :meth:`run`.
+
+        Args:
+            text: The new order ("actually, bring the yellow cylinder instead").
+            at_step: The control step at which to apply it.
+        """
+        self._scheduled_retasks.append((int(at_step), text))
+
+    def _fire_retask(self, text: str, t: int) -> None:
+        """Apply a scheduled re-task now: redirect the current owner onto ``text``."""
+        owner = self.primary_owner
+        if owner is None or self.protocols[owner].current_task is None:
+            return  # no active owner to redirect (mission not yet owned / already done)
+        addr = parse_addressed_instruction(text, self.callsigns)
+        query = resolve_query(addr.body)
+        if query is None:
+            return
+        new_task = dataclasses.replace(self.task, query=query)
+        self.task = new_task
+        # Drop anything the owner is carrying for the OLD target (it is abandoned).
+        if self.carry.carrying(owner):
+            self.carry.drop_here(owner)
+        self._search[owner].stop()
+        self.protocols[owner].retask(new_task, t)
+        # Clear the old F2 ring and re-defer to the new target's first sighting.
+        self._reported_target = None
+        self._target_index = None
+        self._target_scan_base = len(self.bus.transcript)
+        self._last_owner_query = query
+
+    # -- scripted user (CLARIFY dialogue) ---------------------------------
+    def _scene_manifest(self) -> List[dict]:
+        """The object manifest (colour/shape types, positions stripped) for clarify."""
+        return [{"color_name": o.get("color_name"), "shape_name": o.get("shape_name")}
+                for o in self.scene_cfg["objects"]]
+
+    def _pump_user(self, t: int) -> None:
+        """Drain the user inbox and answer any CLARIFY with the next scripted reply.
+
+        The scripted user posts a schema-legal ``USER_REPLY`` (carrying the refined
+        :class:`ObjectQuery`, merged onto the original referent) back to whoever
+        asked — the addressed robot or the allocator. Milestone/terminal messages
+        to the user are display-only (already in the transcript) and simply
+        consumed here. With no CLARIFY outstanding this posts nothing, so an
+        unambiguous mission's transcript is byte-identical."""
+        for msg in self.bus.drain("user"):
+            if msg.performative is Performative.CLARIFY:
+                self._answer_clarify(msg)
+
+    def _answer_clarify(self, msg) -> None:
+        """Post a USER_REPLY answering one CLARIFY (or nothing if replies exhausted)."""
+        if not self._user_replies:
+            return  # no scripted answer left -> recipient's deadline fails the task
+        reply_text = self._user_replies.pop(0)
+        # Merge the reply onto the currently-clarified referent (the owner's live
+        # task, or the runner's task for a fleet order pre-allocation).
+        base = self.task.query if self.task is not None else ObjectQuery()
+        if msg.sender in self.protocols:
+            ct = self.protocols[msg.sender].current_task
+            if ct is not None:
+                base = ct.query
+        refined = refine_query(base, resolve_query(reply_text))
+        # Keep the runner's introspection task(s) in sync with the refined referent.
+        for ctx in self._missions:
+            if ctx.owner == msg.sender:
+                ctx.task = dataclasses.replace(ctx.task, query=refined)
+        if not self._concurrent and self.task is not None:
+            self.task = dataclasses.replace(self.task, query=refined)
+        self.bus.post("user", msg.sender, Performative.USER_REPLY,
+                      {"query": refined, "text": reply_text})
 
     # -- allocator --------------------------------------------------------
     def _run_allocator(self) -> None:
@@ -465,18 +720,89 @@ class MissionRunner:
 
         Newly drained requests join any still-unassigned ones; each is retried
         every drain. A request with no allocatable robot is kept (not dropped) and
-        the user is told once that the order is queued.
+        the user is told once that the order is queued. An ambiguous fleet order is
+        first CLARIFIED by the allocator (it asks the user which object is meant)
+        before any robot is assigned.
         """
+        if self._concurrent:
+            self._run_allocator_multi()
+            return
         for msg in self.bus.drain(self.bus.allocator_inbox):
             if msg.performative is Performative.FLEET_REQUEST:
                 self._pending_fleet.append(msg.payload["task"])
+            elif msg.performative is Performative.USER_REPLY:
+                # The user disambiguated: refine the queued order and allocate it.
+                refined = msg.payload["query"]
+                if self._pending_fleet:
+                    self._pending_fleet[0] = dataclasses.replace(
+                        self._pending_fleet[0], query=refined)
+                if self.task is not None:
+                    self.task = dataclasses.replace(self.task, query=refined)
+                self._alloc_clarifying = False
         if not self._pending_fleet:
+            return
+        # Ambiguous fleet order: the allocator clarifies before allocating.
+        if self._maybe_alloc_clarify(self._pending_fleet[0]):
             return
         still_pending: List[TaskSpec] = []
         for task in self._pending_fleet:
             if not self._try_allocate(task):
                 still_pending.append(task)
         self._pending_fleet = still_pending
+
+    def _maybe_alloc_clarify(self, task: TaskSpec) -> bool:
+        """Whether the allocator is (now) waiting on the user to disambiguate ``task``.
+
+        Posts a CLARIFY the first time an ambiguous fleet order is seen and returns
+        True while awaiting the answer; fails the order ("need clarification") if
+        the deadline passes with the scripted replies exhausted. Returns False when
+        the order is unambiguous (allocate as usual — byte-identical)."""
+        if self._alloc_clarifying:
+            if self._t >= self._alloc_clarify_deadline:
+                self.bus.post("allocator", "user", Performative.TASK_FAILED,
+                              {"reason": "need clarification"})
+                self._pending_fleet = []
+                self._alloc_clarifying = False
+            return True
+        options = clarify_options(task.query, self._scene_manifest())
+        if len(options) > 1:
+            self._alloc_clarifying = True
+            self._alloc_clarify_deadline = self._t + self._clarify_deadline_steps
+            self.bus.post("allocator", "user", Performative.CLARIFY,
+                          {"question": clarify_question(options),
+                           "options": list(options)})
+            return True
+        return False
+
+    def _run_allocator_multi(self) -> None:
+        """Assign each still-unowned concurrent mission a DISTINCT idle owner.
+
+        Drains (and discards) the conjuncts' fleet requests — the missions are the
+        source of truth — then, greedily in mission order, gives each unowned
+        mission the path-shortest idle robot not already owning/assigned to the
+        other. Robots busy assisting the other owner are non-idle and simply not
+        picked, so the two missions' searcher pools never overlap (need-to-know)."""
+        self.bus.drain(self.bus.allocator_inbox)  # the FLEET_REQUESTs were for show
+        poses = {cs: RobotPose(u.xy, u.yaw, u.base_height)
+                 for cs, u in self.fleet.units.items()}
+        taken = {m.owner for m in self._missions if m.owner is not None}
+        for ctx in self._missions:
+            if ctx.owner is not None:
+                continue
+            idle = [cs for cs in self.callsigns
+                    if self.protocols[cs].is_idle() and cs not in taken]
+            result = allocate(poses, self.scene_cfg, ctx.task.query, idle,
+                              vis_cfg=self._vis, regions=self._regions,
+                              rooms=self._rooms)
+            if result.winner is None:
+                continue  # no free robot this step; retry next
+            ctx.owner = result.winner
+            taken.add(result.winner)
+            self.allocation = result
+            self.bus.post("allocator", "user", Performative.STATUS_UPDATE,
+                          {"text": result.describe()})
+            self.bus.post("allocator", result.winner, Performative.REQUEST_TASK,
+                          {"task": ctx.task})
 
     def _try_allocate(self, task: TaskSpec) -> bool:
         """Attempt to assign one task to an idle robot; return whether it stuck."""
@@ -553,6 +879,7 @@ class MissionRunner:
             p.reset()
         for t in range(max_steps):
             self._t = t
+            self._fire_due_retasks(t)
             self._run_allocator()
             self.fleet.step_all()
             self.carry.update()
@@ -560,6 +887,7 @@ class MissionRunner:
                 self._search[cs].tick()
             for cs in self.callsigns:
                 self.protocols[cs].step(t)
+            self._pump_user(t)          # scripted user answers any CLARIFY
             self._perception_step(t)
             self._update_target_knowledge()
             for cs in self.callsigns:
@@ -578,6 +906,16 @@ class MissionRunner:
             self._pending_fleet = []
         return self._result()
 
+    def _fire_due_retasks(self, t: int) -> None:
+        """Apply (once) every scheduled re-task whose step has arrived."""
+        if not self._scheduled_retasks:
+            return
+        due = [(s, txt) for (s, txt) in self._scheduled_retasks if t >= s]
+        self._scheduled_retasks = [(s, txt) for (s, txt) in self._scheduled_retasks
+                                   if t < s]
+        for _s, txt in due:
+            self._fire_retask(txt, t)
+
     def _is_done(self) -> bool:
         """True once a terminal result has reached the user and all robots idle."""
         if self._submitted == 0 or not self._terminal_seen():
@@ -593,15 +931,45 @@ class MissionRunner:
         return self.bus.transcript[self._mission_base:]
 
     def _terminal_seen(self) -> bool:
-        """Whether THIS mission posted a TASK_COMPLETE/TASK_FAILED to the user."""
+        """Whether THIS mission posted a terminal outcome to the user.
+
+        Single mission: any TASK_COMPLETE/TASK_FAILED. Concurrent: BOTH missions
+        must have reached a terminal (each attributed to its own owner), so the
+        run only ends once both owners are done."""
+        if self._concurrent:
+            return all(self._ctx_terminal(ctx) for ctx in self._missions)
         return any(m.performative in (Performative.TASK_COMPLETE,
                                       Performative.TASK_FAILED)
                    for m in self._mission_transcript())
+
+    def _ctx_terminal(self, ctx: "_MissionCtx") -> bool:
+        """Whether one concurrent mission has reached a terminal outcome."""
+        for m in self._mission_transcript():
+            if m.performative not in (Performative.TASK_COMPLETE,
+                                      Performative.TASK_FAILED):
+                continue
+            if ctx.owner is not None and m.sender == ctx.owner:
+                return True
+            if ctx.owner is None and m.sender == "allocator":
+                return True
+        return False
 
     def _result(self) -> MissionResult:
         """Assemble the mission summary from the transcript + world state."""
         outcome = "stopped" if self._cancelled else "timeout"
         complete = False
+        if self._concurrent:
+            terminals = [self._ctx_terminal(c) for c in self._missions]
+            completes = [self._ctx_complete(c) for c in self._missions]
+            if all(completes):
+                outcome, complete = "complete", True
+            elif all(terminals) and not self._cancelled:
+                outcome = "failed"
+            return MissionResult(
+                outcome=outcome, owner=self._missions[0].owner if self._missions else None,
+                steps=self._steps, any_fell=self.fleet.any_fell,
+                object_on_pad=self.object_on_pad(), task_complete_sent=complete,
+                mean_vla_infer_ms=self.fleet.mean_vla_infer_ms())
         for m in self._mission_transcript():
             if m.performative is Performative.TASK_COMPLETE:
                 outcome, complete = "complete", True
@@ -613,6 +981,24 @@ class MissionRunner:
             task_complete_sent=complete,
             mean_vla_infer_ms=self.fleet.mean_vla_infer_ms())
 
+    def _ctx_complete(self, ctx: "_MissionCtx") -> bool:
+        """Whether one concurrent mission delivered (TASK_COMPLETE from its owner)."""
+        return any(m.performative is Performative.TASK_COMPLETE
+                   and ctx.owner is not None and m.sender == ctx.owner
+                   for m in self._mission_transcript())
+
+    def mission_outcomes(self) -> List[str]:
+        """Per-mission outcome labels ("complete"/"failed"/"pending") — concurrent."""
+        out: List[str] = []
+        for ctx in self._missions:
+            if self._ctx_complete(ctx):
+                out.append("complete")
+            elif self._ctx_terminal(ctx):
+                out.append("failed")
+            else:
+                out.append("pending")
+        return out
+
     # -- deferred target symbol (F2) --------------------------------------
     def _update_target_knowledge(self) -> None:
         """Advance the deferred-target state one step (call after protocols step).
@@ -622,7 +1008,25 @@ class MissionRunner:
         pad), and records ``_reported_target`` the first time the object is
         actually located (a peer/searcher report or the owner's own sighting),
         so the ring is drawn only from that moment, at the reported position.
+
+        On a sequential leg or a re-task the owner's referent changes; the ring
+        re-defers to the NEW target's first sighting (scanned from a fresh base),
+        so a delivered leg-A object never leaves a stale ring on the map.
         """
+        if self._concurrent:
+            self._update_concurrent_targets()
+            return
+        # Detect a leg/re-task referent change and re-defer the ring to it.
+        owner = self.primary_owner
+        if owner is not None:
+            ct = self.protocols[owner].current_task
+            cq = ct.query if ct is not None else None
+            if cq is not None:
+                if self._last_owner_query is not None and cq != self._last_owner_query:
+                    self._reported_target = None
+                    self._target_index = None
+                    self._target_scan_base = len(self.bus.transcript)
+                self._last_owner_query = cq
         if self._target_index is None:
             for cs in self.callsigns:
                 idx = self.carry.carried_index(cs)
@@ -634,9 +1038,38 @@ class MissionRunner:
         if self._reported_target is None:
             self._reported_target = self._first_sighting_location()
 
+    def _update_concurrent_targets(self) -> None:
+        """Per-mission deferred-target tracking (two independent F2 rings)."""
+        for ctx in self._missions:
+            if ctx.owner is None:
+                continue
+            if ctx.target_index is None:
+                idx = self.carry.carried_index(ctx.owner)
+                if idx is None:
+                    idx = self.carry.released.get(ctx.owner)
+                if idx is not None:
+                    ctx.target_index = idx
+            if ctx.reported_target is None:
+                ctx.reported_target = self._ctx_first_sighting(ctx)
+
+    def _ctx_first_sighting(self, ctx: "_MissionCtx") -> Optional[XY]:
+        """First located position for one concurrent mission (owner-attributed)."""
+        if ctx.owner is None:
+            return None
+        for m in self.bus.transcript[ctx.scan_base:]:
+            if m.recipient != ctx.owner:
+                continue
+            if m.performative is Performative.REPORT_FOUND:
+                return reconstruct_location(m.payload)
+            if (m.performative is Performative.REPORT_VISIBILITY
+                    and m.payload.get("visible")):
+                return reconstruct_location(m.payload)
+        lt = self.protocols[ctx.owner].located_target
+        return (float(lt[0]), float(lt[1])) if lt is not None else None
+
     def _first_sighting_location(self) -> Optional[XY]:
-        """The object's first reported / first-seen position this mission, or None."""
-        for m in self._mission_transcript():
+        """The object's first reported / first-seen position this leg, or None."""
+        for m in self.bus.transcript[self._target_scan_base:]:
             if m.performative is Performative.REPORT_FOUND:
                 return reconstruct_location(m.payload)
             if (m.performative is Performative.REPORT_VISIBILITY
@@ -651,11 +1084,20 @@ class MissionRunner:
 
     # -- introspection (video / evals) -----------------------------------
     def object_on_pad(self, tol: float = 1.0) -> bool:
-        """Whether the requested object now rests within the delivery pad."""
+        """Whether the requested object(s) now rest within the delivery pad.
+
+        Concurrent: True only when EVERY mission's object is on the pad."""
+        if self._concurrent:
+            return bool(self._missions) and all(
+                self._query_on_pad(m.task.query, tol) for m in self._missions)
         if self.task is None:
             return False
+        return self._query_on_pad(self.task.query, tol)
+
+    def _query_on_pad(self, query: ObjectQuery, tol: float) -> bool:
+        """Whether some object matching ``query`` rests within the delivery pad."""
         for obj in self.scene_cfg["objects"]:
-            if self.task.query.matches(obj):
+            if query.matches(obj):
                 if (abs(float(obj["x"]) - self._dest_xy[0]) <= tol
                         and abs(float(obj["y"]) - self._dest_xy[1]) <= tol):
                     return True
@@ -685,11 +1127,39 @@ class MissionRunner:
         then it sits at the *reported* position, and once a robot picks the
         object up the ring tracks that specific object live (in-hand, then on the
         pad). This is the deferred, honest target marker for the video + BEV.
+        Concurrent missions have one ring each — see :meth:`known_targets`; this
+        returns the first mission's for single-target back-compat.
         """
+        if self._concurrent:
+            tgts = self.known_targets()
+            return tgts[0] if tgts else None
         if self._target_index is not None:
             obj = self.scene_cfg["objects"][self._target_index]
             return (float(obj["x"]), float(obj["y"]))
         return self._reported_target
+
+    def known_targets(self) -> List[Optional[XY]]:
+        """Per-mission deferred target ring positions (one per concurrent mission).
+
+        For a single mission this is a one-element list mirroring
+        :meth:`known_target_xy`; for a concurrent (two-owner) mission it is one
+        entry per owner, each ``None`` until that owner has located its object,
+        then its reported/live position. The video composer draws one ring per
+        entry."""
+        if not self._concurrent:
+            return [self.known_target_xy()]
+        out: List[Optional[XY]] = []
+        for ctx in self._missions:
+            if ctx.target_index is not None:
+                obj = self.scene_cfg["objects"][ctx.target_index]
+                out.append((float(obj["x"]), float(obj["y"])))
+            else:
+                out.append(ctx.reported_target)
+        return out
+
+    # Public alias for the demo composer's multi-goal ring hook (it looks up
+    # ``known_targets_xy``): one deferred ring position per active mission.
+    known_targets_xy = known_targets
 
     def phase(self) -> str:
         """A short HUD phrase describing what the fleet is doing right now."""

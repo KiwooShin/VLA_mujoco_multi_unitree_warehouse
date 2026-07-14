@@ -22,7 +22,7 @@ from __future__ import annotations
 import dataclasses
 import enum
 from types import MappingProxyType
-from typing import Any, Mapping, Optional, Tuple
+from typing import Any, List, Mapping, Optional, Sequence, Tuple
 
 
 # ---------------------------------------------------------------------------
@@ -42,6 +42,8 @@ class Performative(enum.Enum):
     TASK_COMPLETE = "TASK_COMPLETE"        # owner -> requester: task done
     TASK_FAILED = "TASK_FAILED"            # owner -> requester: task failed (reason)
     FLEET_REQUEST = "FLEET_REQUEST"        # user -> fleet: any robot bring O
+    CLARIFY = "CLARIFY"                    # recipient(robot/allocator) -> user: which O?
+    USER_REPLY = "USER_REPLY"              # user -> recipient: the refined referent
 
 
 class TaskKind(enum.Enum):
@@ -148,6 +150,11 @@ _REQUIRED_PAYLOAD: Mapping[Performative, Tuple[str, ...]] = MappingProxyType({
     Performative.TASK_COMPLETE: ("text",),
     Performative.TASK_FAILED: ("reason",),
     Performative.FLEET_REQUEST: ("task",),
+    # CLARIFY carries the natural-language question plus the describe() strings the
+    # user chooses between; USER_REPLY carries the refined :class:`ObjectQuery`
+    # (plus the raw reply ``text`` for a natural transcript line).
+    Performative.CLARIFY: ("question", "options"),
+    Performative.USER_REPLY: ("query",),
 })
 
 
@@ -250,3 +257,75 @@ def reconstruct_location(payload: Mapping[str, Any]) -> Tuple[float, float]:
     rp = payload["reporter_pose"]
     ro = payload["rel_offset"]
     return (float(rp[0]) + float(ro[0]), float(rp[1]) + float(ro[1]))
+
+
+# ---------------------------------------------------------------------------
+# Clarification (ambiguous ObjectQuery against the scene manifest)
+# ---------------------------------------------------------------------------
+# A robot / allocator knows the object MANIFEST — the set of (colour, shape)
+# *types* in the warehouse — but NOT where any object stands (positions are only
+# discovered by looking / searching). Ambiguity is therefore judged purely on the
+# manifest: a query that matches more than one DISTINCT describable object type is
+# ambiguous ("the cube" with a red, a blue and a yellow cube), and the fetcher
+# must ask the user which one is meant before it can act.
+def clarify_options(query: "ObjectQuery",
+                    manifest: Sequence[Mapping[str, Any]]) -> List[str]:
+    """Return the DISTINCT ``describe()`` strings a query matches in the manifest.
+
+    Args:
+        query: The requested referent (may be a wildcard / partial referent).
+        manifest: The known object types — mappings with ``color_name`` /
+            ``shape_name`` keys (positions are *not* read, honouring the
+            "types/colours known, positions unknown" assumption).
+
+    Returns:
+        The distinct object descriptions the query matches, in first-seen order.
+        A length ``> 1`` means the query is ambiguous (a clarification is due); a
+        length ``<= 1`` means it is already unambiguous (no clarification — the
+        existing fetch behaviour is byte-identical).
+    """
+    seen: List[str] = []
+    for obj in manifest:
+        if not query.matches(obj):
+            continue
+        desc = ObjectQuery(obj.get("color_name"), obj.get("shape_name")).describe()
+        if desc not in seen:
+            seen.append(desc)
+    return seen
+
+
+def _article(phrase: str) -> str:
+    """Return ``"a"``/``"an"`` for ``phrase`` (crude vowel test, good enough here)."""
+    return "an" if phrase[:1].lower() in "aeiou" else "a"
+
+
+def clarify_question(options: Sequence[str]) -> str:
+    """Phrase the natural CLARIFY question over the ambiguous ``options``.
+
+    E.g. ``["red cube", "blue cube", "yellow cube"]`` ->
+    ``"The warehouse has a red cube, a blue cube and a yellow cube - which one do
+    you mean?"``.
+    """
+    items = [f"{_article(o)} {o}" for o in options]
+    if len(items) <= 1:
+        listing = items[0] if items else "an object"
+    else:
+        listing = ", ".join(items[:-1]) + " and " + items[-1]
+    return f"The warehouse has {listing} - which one do you mean?"
+
+
+def refine_query(original: "ObjectQuery",
+                 reply: Optional["ObjectQuery"]) -> "ObjectQuery":
+    """Merge a user's clarification ``reply`` onto the ``original`` referent.
+
+    The reply fills in whichever fields it specifies (a bare "the red one" only
+    pins the colour), keeping the original's other fields, so "the cube" + "red"
+    resolves to the red cube. A ``None`` reply (nothing resolvable) leaves the
+    original unchanged (still ambiguous -> a further clarification or timeout).
+    """
+    if reply is None:
+        return original
+    return ObjectQuery(
+        color_name=reply.color_name if reply.color_name is not None else original.color_name,
+        shape_name=reply.shape_name if reply.shape_name is not None else original.shape_name,
+    )

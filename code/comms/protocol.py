@@ -34,6 +34,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from code.comms.bus import MessageBus
 from code.comms.messages import (Message, ObjectQuery, Performative, TaskSpec,
+                                 clarify_options, clarify_question,
                                  reconstruct_location, relative_report_payload)
 
 XY = Tuple[float, float]
@@ -101,6 +102,7 @@ class RobotState(enum.Enum):
     """The coordination state of one robot."""
 
     IDLE = "IDLE"
+    OWNER_CLARIFYING = "OWNER_CLARIFYING"    # asked the user which object; awaiting reply
     OWNER_QUERYING = "OWNER_QUERYING"        # queried a peer, awaiting its reply
     OWNER_DELEGATING = "OWNER_DELEGATING"    # commanded searchers, awaiting a find
     OWNER_NAVIGATING = "OWNER_NAVIGATING"    # walking to the located object
@@ -130,6 +132,20 @@ class RobotActions(abc.ABC):
     @abc.abstractmethod
     def can_see(self, query: ObjectQuery) -> Optional[XY]:
         """Return the object's world ``(x, y)`` if currently visible, else ``None``."""
+
+    def object_manifest(self) -> Sequence[dict]:
+        """Return the known object MANIFEST — colour/shape types, no positions.
+
+        A robot knows *what kinds* of objects the warehouse holds (from the scene
+        configuration) but not where any of them stand. The protocol consults this
+        manifest to decide whether an :class:`ObjectQuery` is ambiguous (matches
+        more than one distinct object type) and, if so, to phrase the CLARIFY
+        question. The base implementation returns an empty manifest, which makes
+        every query trivially unambiguous — so a scripted test fake (or any
+        manifest-less deployment) never clarifies and the historical fetch path is
+        byte-identical. The fleet bridge overrides it with the scene's distinct
+        ``{color_name, shape_name}`` types (positions stripped)."""
+        return ()
 
     def reconfirm_target(self, query: ObjectQuery) -> Optional[XY]:
         """Force a fresh close-range perception fix on the target, or ``None``.
@@ -262,6 +278,7 @@ class RobotProtocol:
                  search_regions: Sequence[str] = DEFAULT_REGIONS,
                  reply_deadline_steps: int = 50,
                  search_deadline_steps: int = 2000,
+                 clarify_deadline_steps: int = 400,
                  region_assigner: Optional[RegionAssigner] = None) -> None:
         self.callsign = callsign
         self._bus = bus
@@ -270,6 +287,7 @@ class RobotProtocol:
         self._regions: Tuple[str, ...] = tuple(search_regions)
         self._reply_deadline = int(reply_deadline_steps)
         self._search_deadline_steps = int(search_deadline_steps)
+        self._clarify_deadline_steps = int(clarify_deadline_steps)
         self._region_assigner = region_assigner
 
         self._state = RobotState.IDLE
@@ -277,6 +295,10 @@ class RobotProtocol:
 
         # Owner-role bookkeeping (valid only while owning a task).
         self._task: Optional[TaskSpec] = None
+        # Sequential multi-goal: remaining legs to fetch after the current one.
+        self._legs: List[TaskSpec] = []
+        # Clarification: deadline for the user's reply while OWNER_CLARIFYING.
+        self._clarify_deadline = 0
         self._query_queue: List[str] = []
         self._awaiting_peer: Optional[str] = None
         self._query_deadline = 0
@@ -313,6 +335,15 @@ class RobotProtocol:
         return self._state is RobotState.IDLE
 
     @property
+    def current_task(self) -> Optional[TaskSpec]:
+        """The task (leg) this owner is currently fetching, or ``None`` if idle.
+
+        Tracks the active referent across sequential legs and mid-mission
+        re-tasks, so the mission layer can follow the live target (F2 ring) as it
+        changes."""
+        return self._task
+
+    @property
     def located_target(self) -> Optional[XY]:
         """The object position this owner has located, or ``None`` (F2).
 
@@ -343,6 +374,7 @@ class RobotProtocol:
         if self._state is RobotState.ASSIST_SEARCHING:
             self._actions.abort_search()
         self._task = None
+        self._legs = []
         self._query_queue = []
         self._awaiting_peer = None
         self._pending_accept = set()
@@ -420,6 +452,8 @@ class RobotProtocol:
         perf = msg.performative
         if perf is Performative.REQUEST_TASK:
             self._on_request_task(msg, t)
+        elif perf is Performative.USER_REPLY:
+            self._on_user_reply(msg, t)
         elif perf is Performative.QUERY_VISIBILITY:
             self._on_query_visibility(msg, t)
         elif perf is Performative.REPORT_VISIBILITY:
@@ -440,13 +474,87 @@ class RobotProtocol:
         if not self.is_idle():
             return  # busy: silently decline (allocator picks an idle robot)
         self._task = msg.payload["task"]
+        # Sequential multi-goal: any further legs to fetch after this one.
+        self._legs = list(msg.payload.get("legs", ()))
         self.last_result = None
+        self._begin_task(t)
+
+    def _begin_task(self, t: int) -> None:
+        """Clarify an ambiguous referent, else start the fetch cascade for ``_task``.
+
+        The single entry into a fetch leg — used by the initial ``REQUEST_TASK``,
+        each sequential leg, a re-task, and each accepted clarification reply — so
+        every one of them gets the identical "clarify if ambiguous, else check own
+        view -> query peers -> delegate search" behaviour.
+        """
+        options = clarify_options(self._task.query, self._actions.object_manifest())
+        if len(options) > 1:
+            self._enter_clarifying(options, t)
+            return
         loc = self._actions.can_see(self._task.query)
         if loc is not None:
             self._begin_owner_leg(loc, t)
         else:
             self._query_queue = list(self._peers)
             self._start_next_query(t)
+
+    # -- owner role: clarification dialogue -------------------------------
+    def _enter_clarifying(self, options: Sequence[str], t: int) -> None:
+        """Ask the requester which object is meant and await a USER_REPLY."""
+        self._state = RobotState.OWNER_CLARIFYING
+        self._clarify_deadline = t + self._clarify_deadline_steps
+        self._notify_user(Performative.CLARIFY,
+                          question=clarify_question(options),
+                          options=list(options))
+
+    def _on_user_reply(self, msg: Message, t: int) -> None:
+        """Adopt the user's refined referent and (re)start the fetch leg."""
+        if self._state is not RobotState.OWNER_CLARIFYING or self._task is None:
+            return
+        if msg.sender != self._task.requester:
+            return  # a reply for someone else / stale
+        refined = msg.payload["query"]
+        self._task = dataclasses.replace(self._task, query=refined)
+        self._begin_task(t)  # unambiguous -> fetch; still ambiguous -> re-clarify
+
+    def retask(self, new_task: TaskSpec, t: int) -> bool:
+        """Redirect this owner mid-mission onto ``new_task`` (F: mid-mission re-task).
+
+        Stands down any helpers it commanded, abandons the current
+        approach/search bookkeeping, keeps ownership, and re-enters
+        :meth:`_begin_task` for the new referent (clarifying again if the new
+        referent is itself ambiguous). Any queued sequential legs are dropped —
+        the re-task replaces the remaining mission. No-op (returns False) if this
+        protocol does not currently own a task.
+
+        Args:
+            new_task: The replacement task to fetch now.
+            t: The current simulation step.
+
+        Returns:
+            True if the owner was redirected; False if it held no task.
+        """
+        if self._task is None or self._state is RobotState.IDLE:
+            return False
+        self._cancel_active_searchers()  # stand down every helper it commanded
+        self._query_queue = []
+        self._awaiting_peer = None
+        self._pending_accept = set()
+        self._searchers = set()
+        self._reserve = []
+        self._peer_region = {}
+        self._nav_target = None
+        self._nav_target_approx = False
+        self._own_confirm = False
+        self._own_confirm_best = None
+        self._pickup_retries = 0
+        self._legs = []
+        self._task = new_task
+        self._notify_user(
+            Performative.STATUS_UPDATE,
+            text=f"New orders — switching to the {new_task.query.describe()}.")
+        self._begin_task(t)
+        return True
 
     def _begin_owner_leg(self, loc: XY, t: int) -> None:
         """Start the owner's fetch from its OWN first sighting (CONFIRM-THEN-REPORT).
@@ -736,6 +844,19 @@ class RobotProtocol:
             self._fail_owner(self._actions.failure_reason(), t)
             return
         if t > self._nav_issued_t and self._actions.arrived():
+            if self._legs:
+                # Sequential multi-goal: this leg is delivered, but more remain —
+                # report the per-leg milestone (NOT completion) and start the next
+                # leg's fresh query/search cycle. TASK_COMPLETE waits for the last.
+                nxt = self._legs.pop(0)
+                self._notify_user(
+                    Performative.STATUS_UPDATE,
+                    text=(f"Delivered the {self._task.query.describe()} to the "
+                          f"{self._task.destination_name}; now fetching the "
+                          f"{nxt.query.describe()}."))
+                self._task = nxt
+                self._begin_task(t)
+                return
             self._notify_user(
                 Performative.TASK_COMPLETE,
                 text=(f"Delivered the {self._task.query.describe()} to the "
@@ -750,6 +871,7 @@ class RobotProtocol:
     def _finish_owner(self, result: str) -> None:
         self.last_result = result
         self._task = None
+        self._legs = []
         self._query_queue = []
         self._awaiting_peer = None
         self._pending_accept = set()
@@ -970,7 +1092,10 @@ class RobotProtocol:
     # -- per-step time/perception advance ---------------------------------
     def _tick_state(self, t: int) -> None:
         state = self._state
-        if state is RobotState.OWNER_QUERYING:
+        if state is RobotState.OWNER_CLARIFYING:
+            if t >= self._clarify_deadline:  # user never disambiguated -> give up
+                self._fail_owner("need clarification", t)
+        elif state is RobotState.OWNER_QUERYING:
             if t >= self._query_deadline:  # peer never answered -> not visible
                 self._start_next_query(t)
         elif state is RobotState.OWNER_DELEGATING:

@@ -10,9 +10,59 @@ from code.comms.messages import (
     Performative,
     TaskKind,
     TaskSpec,
+    clarify_options,
+    clarify_question,
     reconstruct_location,
+    refine_query,
     relative_report_payload,
 )
+
+_CUBES = ({"color_name": "red", "shape_name": "cube"},
+          {"color_name": "blue", "shape_name": "cube"},
+          {"color_name": "yellow", "shape_name": "cube"})
+
+
+class TestClarifyHelpers(unittest.TestCase):
+    """clarify_options / clarify_question / refine_query (ambiguity vs the manifest)."""
+
+    def test_generic_query_matches_all_distinct_types(self) -> None:
+        self.assertEqual(clarify_options(ObjectQuery(None, "cube"), _CUBES),
+                         ["red cube", "blue cube", "yellow cube"])
+
+    def test_specific_query_is_unambiguous(self) -> None:
+        self.assertEqual(clarify_options(ObjectQuery("red", "cube"), _CUBES),
+                         ["red cube"])
+
+    def test_identical_duplicates_are_not_ambiguous(self) -> None:
+        # Two indistinguishable red cubes -> one distinct describe -> no clarify.
+        manifest = ({"color_name": "red", "shape_name": "cube"},
+                    {"color_name": "red", "shape_name": "cube"})
+        self.assertEqual(clarify_options(ObjectQuery(None, "cube"), manifest),
+                         ["red cube"])
+
+    def test_wildcard_matches_every_type(self) -> None:
+        manifest = _CUBES + ({"color_name": "green", "shape_name": "ball"},)
+        opts = clarify_options(ObjectQuery(None, None), manifest)
+        self.assertEqual(len(opts), 4)
+
+    def test_question_lists_options_naturally(self) -> None:
+        q = clarify_question(["red cube", "blue cube", "yellow cube"])
+        self.assertEqual(
+            q, "The warehouse has a red cube, a blue cube and a yellow cube - "
+               "which one do you mean?")
+
+    def test_question_uses_an_before_vowel(self) -> None:
+        self.assertIn("an orange cube", clarify_question(["orange cube", "red cube"]))
+
+    def test_refine_fills_missing_fields(self) -> None:
+        # "the cube" + "red" -> red cube; a bare colour keeps the original shape.
+        self.assertEqual(
+            refine_query(ObjectQuery(None, "cube"), ObjectQuery("red", None)),
+            ObjectQuery("red", "cube"))
+
+    def test_refine_none_reply_keeps_original(self) -> None:
+        orig = ObjectQuery(None, "cube")
+        self.assertEqual(refine_query(orig, None), orig)
 
 
 def _msg(performative: Performative, payload=None, **kw) -> Message:

@@ -146,6 +146,18 @@ class FleetRobotActions(RobotActions):
                 return self._confirm(query, oxy)
         return None
 
+    def object_manifest(self) -> List[dict]:
+        """Return the scene's object MANIFEST — colour/shape types, no positions.
+
+        A robot knows *what kinds* of objects the warehouse holds (read from the
+        shared scene configuration) but never where they stand: only ``color_name``
+        and ``shape_name`` are exposed, with the ``x``/``y`` deliberately stripped.
+        The protocol uses this to decide whether an :class:`ObjectQuery` is
+        ambiguous (matches more than one distinct type) and to phrase the CLARIFY
+        question."""
+        return [{"color_name": o.get("color_name"), "shape_name": o.get("shape_name")}
+                for o in self._cfg["objects"]]
+
     def reconfirm_target(self, query: ObjectQuery) -> Optional[XY]:
         """Force a fresh close-range detector fix on the target (groundnet only).
 

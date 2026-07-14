@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -1447,3 +1447,168 @@ def sample_rooms6_layout(rng: np.random.Generator, *, max_attempts: int = 200,
         f"sample_rooms6_layout: no valid+reachable layout in {max_attempts} "
         f"attempts (seed_tag={seed_tag}); last diagnostics: {diagnostics[-6:]}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Random robot spawn poses (Demo Set v2 — random start locations)
+# ---------------------------------------------------------------------------
+# A demo can start the robots at RANDOM free positions instead of their home
+# bays. The sampler draws deterministic, well-spaced, reachability-validated
+# poses from the FREE cells of the deployed inflated planner grid, so a robot
+# never spawns in a wall/shelf/object and can reach every room (and the delivery
+# pad) it may be tasked toward.
+_SPAWN_CLEARANCE_M: float = 0.5      # keep each spawn this far from any wall/object
+_SPAWN_MIN_SPACING_M: float = 1.0    # min pairwise spawn separation (spec: >= 1.0 m)
+_SPAWN_GRID_RES: float = 0.1         # occupancy grid cell size (m)
+
+
+def _spawn_reach_targets(
+    layout: WarehouseLayout, free_cells: List[Tuple[float, float]],
+) -> List[Tuple[str, Tuple[float, float]]]:
+    """Points every spawn must be able to reach: one per room + the delivery pad.
+
+    Each room's target is the free cell nearest its centre (so a shelf on the
+    centroid never makes a genuinely reachable room look blocked); the hero single
+    hall has no rooms, so only the delivery pad is required. Reaching all of these
+    certifies a spawn can participate in a search of any room and deliver.
+    """
+    targets: List[Tuple[str, Tuple[float, float]]] = []
+    for room in layout.rooms:
+        best: Optional[Tuple[float, float]] = None
+        best_d = float("inf")
+        for (cx, cy) in free_cells:
+            if room_of(layout, (cx, cy)) != room.name:
+                continue
+            d = math.hypot(cx - room.cx, cy - room.cy)
+            if d < best_d:
+                best_d, best = d, (cx, cy)
+        if best is not None:
+            targets.append((f"room:{room.name}", best))
+    for z in layout.zones:
+        if z.name == "delivery":
+            targets.append(("delivery", (float(z.cx), float(z.cy))))
+            break
+    return targets
+
+
+def sample_spawn_poses(
+    layout: WarehouseLayout,
+    callsigns: Sequence[str] = CALLSIGNS,
+    *,
+    seed: int = 0,
+    objects: Optional[Sequence[dict]] = None,
+    min_spacing_m: float = _SPAWN_MIN_SPACING_M,
+    clearance_m: float = _SPAWN_CLEARANCE_M,
+    inflations: Tuple[float, ...] = _PLAN_INFLATIONS,
+    max_draws: int = 4000,
+) -> Dict[str, Tuple[float, float, float]]:
+    """Sample deterministic, spaced, reachability-checked random spawn poses.
+
+    Draws one ``(x, y, yaw)`` pose per callsign from the FREE cells of the
+    inflated planner grid (walls + every object stamped as an obstacle, dilated by
+    ``clearance_m``), keeping poses at least ``min_spacing_m`` apart and requiring
+    each to plan — at every inflation in ``inflations`` — to every room and the
+    delivery pad (:func:`_spawn_reach_targets`). Fully deterministic per ``seed``
+    (a shuffled candidate order + greedy first-fit acceptance), and layout-family
+    agnostic (hero / rooms / rooms6 / sampled).
+
+    Args:
+        layout: The layout to spawn into (its walls/rooms/zones/spots).
+        callsigns: Robots to place (one pose each; determines dict order).
+        seed: RNG seed — the same seed always yields the same poses.
+        objects: Explicit scene objects to stamp as obstacles; when ``None`` the
+            layout's ``object_spots`` are stamped at a representative size (so a
+            spawn never lands on a spot even before objects are sampled).
+        min_spacing_m: Minimum pairwise spawn separation (m).
+        clearance_m: Robot-body clearance kept from any wall/object (m).
+        inflations: Plan-clearance radii a spawn must route to every target at.
+        max_draws: Candidate cap before giving up (deterministic failure).
+
+    Returns:
+        ``callsign -> (x, y, yaw)`` for every callsign, yaw facing the hall centre.
+
+    Raises:
+        RuntimeError: If ``callsigns`` cannot be placed within ``max_draws``.
+    """
+    from code.apps.warehouse_demo.planning import add_object_obstacles
+    from code.planner.astar import PathNotFoundError, plan_path
+    from code.planner.grid import inflate
+    from code.warehouse.occupancy import occupancy_grid
+
+    callsigns = list(callsigns)
+    # Objects (or object_spots) stamped as obstacles at a representative size.
+    if objects is not None:
+        gate_objects = [{"x": float(o["x"]), "y": float(o["y"]),
+                         "size": float(o.get("size", _GATE_OBJECT_SIZE_M))}
+                        for o in objects]
+    else:
+        gate_objects = [{"x": float(x), "y": float(y), "size": _GATE_OBJECT_SIZE_M}
+                        for (x, y) in layout.object_spots]
+
+    og = occupancy_grid(layout, _SPAWN_GRID_RES)
+    stamped = (add_object_obstacles(og, gate_objects, None, 0.0)
+               if gate_objects else og)
+    free_grid = inflate(stamped, clearance_m)
+    ny, nx = free_grid.grid.shape
+    free_cells: List[Tuple[float, float]] = [
+        (round(free_grid.cell_to_world((iy, ix))[0], 3),
+         round(free_grid.cell_to_world((iy, ix))[1], 3))
+        for iy in range(ny) for ix in range(nx) if not free_grid.grid[iy, ix]
+    ]
+    if len(free_cells) < len(callsigns):
+        raise RuntimeError(
+            f"sample_spawn_poses: only {len(free_cells)} free cells for "
+            f"{len(callsigns)} robots on layout {layout.name!r}")
+
+    targets = _spawn_reach_targets(layout, free_cells)
+    # Per-(goal, inflation) inflated grids, objects stamped with the goal left
+    # approachable — exactly the grid the deployed fleet plans over.
+    grid_cache: Dict[Tuple[float, float, float], object] = {}
+
+    def _grid_for(goal_xy: Tuple[float, float], r: float):
+        key = (round(goal_xy[0], 3), round(goal_xy[1], 3), r)
+        ig = grid_cache.get(key)
+        if ig is None:
+            gstamped = (add_object_obstacles(og, gate_objects, goal_xy,
+                                             _GATE_EXCLUDE_RADIUS_M)
+                        if gate_objects else og)
+            ig = inflate(gstamped, r)
+            grid_cache[key] = ig
+        return ig
+
+    def _reaches_all(xy: Tuple[float, float]) -> bool:
+        for _tag, goal in targets:
+            for r in inflations:
+                try:
+                    path = plan_path(_grid_for(goal, r), xy, goal, snap_radius_m=0.4)
+                except PathNotFoundError:
+                    return False
+                if not path:
+                    return False
+        return True
+
+    rng = np.random.default_rng(seed)
+    order = list(range(len(free_cells)))
+    rng.shuffle(order)
+
+    chosen: List[Tuple[float, float]] = []
+    for draw, idx in enumerate(order):
+        if len(chosen) == len(callsigns) or draw >= max_draws:
+            break
+        cand = free_cells[idx]
+        if any(math.hypot(cand[0] - cx, cand[1] - cy) < min_spacing_m
+               for cx, cy in chosen):
+            continue
+        if not _reaches_all(cand):
+            continue
+        chosen.append(cand)
+    if len(chosen) < len(callsigns):
+        raise RuntimeError(
+            f"sample_spawn_poses: placed only {len(chosen)}/{len(callsigns)} "
+            f"reachable spawns on layout {layout.name!r} (seed={seed})")
+
+    poses: Dict[str, Tuple[float, float, float]] = {}
+    for cs, (x, y) in zip(callsigns, chosen):
+        yaw = math.atan2(-y, -x) if (x or y) else 0.0  # face the hall centre
+        poses[cs] = (float(x), float(y), float(yaw))
+    return poses

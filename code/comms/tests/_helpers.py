@@ -74,8 +74,10 @@ class FakeActions(RobotActions):
                  confirm_range: Optional[float] = None,
                  approach_location: Optional[XY] = None,
                  approach_after_polls: int = 0,
+                 manifest: Optional[Sequence[dict]] = None,
                  pose: XY = (0.0, 0.0), room: str = "the area") -> None:
         self.static_location = static_location
+        self.manifest = list(manifest) if manifest is not None else []
         self.search_location = search_location
         self.find_after_polls = find_after_polls
         self._arrives = arrives
@@ -108,6 +110,9 @@ class FakeActions(RobotActions):
                 return self.approach_location
             return self.static_location   # still far, mid-approach
         return self.static_location
+
+    def object_manifest(self):
+        return self.manifest
 
     def confirm_report_range_m(self) -> Optional[float]:
         return self.confirm_range

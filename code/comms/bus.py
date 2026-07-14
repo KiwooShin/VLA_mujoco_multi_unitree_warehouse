@@ -94,6 +94,11 @@ def _phrase(perf: Performative, payload: Mapping[str, Any],
         return f"couldn't finish — {payload.get('reason', 'unknown reason')}"
     if perf is Performative.FLEET_REQUEST:
         return f"any robot: {_describe(payload.get('task'))}"
+    if perf is Performative.CLARIFY:
+        return str(payload.get("question", "which one do you mean?"))
+    if perf is Performative.USER_REPLY:
+        text = payload.get("text")
+        return str(text) if text else f"I mean the {_describe(payload.get('query'))}"
     return ""
 
 

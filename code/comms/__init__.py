@@ -21,7 +21,10 @@ from code.comms.messages import (
     Performative,
     TaskKind,
     TaskSpec,
+    clarify_options,
+    clarify_question,
     reconstruct_location,
+    refine_query,
     relative_report_payload,
 )
 from code.comms.protocol import (
@@ -42,7 +45,10 @@ __all__ = [
     "Performative",
     "TaskKind",
     "TaskSpec",
+    "clarify_options",
+    "clarify_question",
     "reconstruct_location",
+    "refine_query",
     "relative_report_payload",
     "RobotActions",
     "RobotProtocol",

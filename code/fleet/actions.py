@@ -50,7 +50,8 @@ class _UnitLike(Protocol):
 
 
 class _SearchLike(Protocol):
-    def start(self, scene_cfg: dict, region: str) -> bool: ...
+    def start(self, scene_cfg: dict, region: str, *,
+              cycle_regions: Optional[Sequence[str]] = None) -> bool: ...
     def stop(self) -> None: ...
 
 
@@ -119,6 +120,12 @@ class FleetRobotActions(RobotActions):
         # "detector" (GROUND_NET confirmed), "oracle_fallback" (oracle-visible but
         # the detector missed), or "oracle" (oracle mode / out of confirm range).
         self.last_see_source: Optional[str] = None
+        # Concurrent-mission multi-room sweep: when set (the runner enables it for
+        # a two-owner mission), a delegated search sweeps the commanded room first
+        # then cycles through the rest, so one searcher covers more rooms than the
+        # fleet has searchers. ``None`` (default) sweeps only the commanded room —
+        # byte-identical single-mission behaviour.
+        self._search_cycle_regions: Optional[List[str]] = None
 
     # -- perception -------------------------------------------------------
     def can_see(self, query: ObjectQuery) -> Optional[XY]:
@@ -256,8 +263,21 @@ class FleetRobotActions(RobotActions):
         return "goal unreachable"
 
     # -- search -----------------------------------------------------------
+    def enable_search_cycle(self, regions: Optional[Sequence[str]]) -> None:
+        """Turn multi-room sweep on (concurrent) or off (single-mission).
+
+        ``regions`` (the mission's full ordered region list) makes a delegated
+        search sweep its commanded room then cycle through the others; ``None``
+        restores the single-room patrol (byte-identical single-mission path).
+        """
+        self._search_cycle_regions = list(regions) if regions else None
+
     def start_search(self, query: ObjectQuery, region: str) -> bool:
         """Begin patrolling a named region for the object.
+
+        In concurrent mode (see :meth:`enable_search_cycle`) the searcher sweeps
+        the commanded ``region`` first and then cycles through the remaining rooms,
+        so a single searcher can cover more rooms than the fleet has searchers.
 
         Returns:
             True if the controller found a reachable patrol; False if the region
@@ -266,6 +286,10 @@ class FleetRobotActions(RobotActions):
         # A fresh search assignment clears any stale plan-failure from a prior
         # navigation so :meth:`failed` reflects only this searcher's own motion.
         self.last_plan_ok = None
+        if self._search_cycle_regions:
+            others = [r for r in self._search_cycle_regions if r != region]
+            return bool(self._search.start(self._cfg, region,
+                                           cycle_regions=[region] + others))
         return bool(self._search.start(self._cfg, region))
 
     def abort_search(self) -> None:

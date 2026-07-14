@@ -264,22 +264,48 @@ class SearchController:
         self._idx = 0
         self.active = False
         self.region: Optional[str] = None
+        # Multi-room cycling (concurrent missions only): when ``_cycle`` is a list
+        # of region names the controller sweeps the current region fully then
+        # advances to the next room in the list (looping). ``None`` -> the single
+        # region loops forever, the historical single-mission behaviour.
+        self._scene_cfg: Optional[dict] = None
+        self._cycle: Optional[List[str]] = None
+        self._plan_kw: dict = {}
+        self._visits = 0
 
-    def start(self, scene_cfg: dict, region: str, **kw) -> bool:
+    def start(self, scene_cfg: dict, region: str, *,
+              cycle_regions: Optional[Sequence[str]] = None, **kw) -> bool:
         """Plan the region patrol and start walking its first waypoint.
 
         Args:
             scene_cfg: Warehouse scene_cfg.
-            region: Region to patrol.
+            region: Region to patrol (the first, when cycling).
+            cycle_regions: When given (concurrent search), the ordered list of
+                regions to sweep in turn — the controller advances to the next
+                once the current is fully swept, so one searcher can cover more
+                rooms than the fleet has searchers. ``None`` (default) patrols the
+                single ``region`` forever (byte-identical single-mission path).
             **kw: Forwarded to :func:`patrol_waypoints`.
 
         Returns:
             True if at least one reachable waypoint was assigned.
         """
-        kw.setdefault("start_xy", self._unit.xy)
+        self._scene_cfg = scene_cfg
+        self._cycle = list(cycle_regions) if cycle_regions else None
         kw.setdefault("rooms", self._rooms)
-        self._waypoints = patrol_waypoints(scene_cfg, region, **kw)
+        self._plan_kw = dict(kw)
+        return self._plan_region(region, first=True)
+
+    def _plan_region(self, region: str, *, first: bool = False) -> bool:
+        """Plan (or re-plan) the patrol for ``region`` and start walking it."""
+        kw = dict(self._plan_kw)
+        if first:
+            kw.setdefault("start_xy", self._unit.xy)
+        else:
+            kw["start_xy"] = self._unit.xy  # enter the next room from where we are
+        self._waypoints = patrol_waypoints(self._scene_cfg, region, **kw)
         self._idx = 0
+        self._visits = 0
         self.region = region
         self.active = bool(self._waypoints)
         if self.active:
@@ -305,8 +331,17 @@ class SearchController:
         if not self.active or not self._waypoints:
             return
         if self._unit.done or not self._unit.active:
-            self._idx = (self._idx + 1) % len(self._waypoints)
-            self._assign_reachable()
+            self._visits += 1
+            if self._cycle and self._visits >= len(self._waypoints):
+                # Swept this room fully -> move on to the next in the cycle. The
+                # object may be in a room this searcher was not first assigned, so
+                # one searcher eventually covers them all (concurrent coverage).
+                i = (self._cycle.index(self.region)
+                     if self.region in self._cycle else -1)
+                self._plan_region(self._cycle[(i + 1) % len(self._cycle)])
+            else:
+                self._idx = (self._idx + 1) % len(self._waypoints)
+                self._assign_reachable()
 
     def stop(self) -> None:
         """Abort the search and hold the robot in place."""

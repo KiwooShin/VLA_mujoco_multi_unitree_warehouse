@@ -45,6 +45,16 @@ XY = Tuple[float, float]
 # fleet layer injects an A*-nearest-room assigner for the multi-room layout.
 RegionAssigner = Callable[[Sequence[str], Sequence[str]], List[Tuple[str, str]]]
 
+# A recruit-filter hook: returns the set of peers this owner may recruit as
+# searchers right now, or ``None`` for no limit. Single-mission missions pass no
+# hook (or a hook returning ``None``) so recruitment sees every peer and the
+# transcript is byte-identical. The fleet layer injects one in concurrent
+# (two-owner) mode so the K owners partition the free peers into disjoint pools
+# instead of the first owner to delegate grabbing them all — the cross-owner
+# searcher budget that closes the searcher-starvation gap while keeping
+# need-to-know structural (an owner can only ever command peers in its pool).
+RecruitableHook = Callable[[], Optional[Set[str]]]
+
 # How many times a missed mock pickup is re-attempted (re-approach) before the
 # owner declares the fetch failed. One retry is enough for a transient miss.
 MAX_PICKUP_RETRIES: int = 1
@@ -279,7 +289,8 @@ class RobotProtocol:
                  reply_deadline_steps: int = 50,
                  search_deadline_steps: int = 2000,
                  clarify_deadline_steps: int = 400,
-                 region_assigner: Optional[RegionAssigner] = None) -> None:
+                 region_assigner: Optional[RegionAssigner] = None,
+                 recruitable_hook: Optional[RecruitableHook] = None) -> None:
         self.callsign = callsign
         self._bus = bus
         self._actions = actions
@@ -289,6 +300,7 @@ class RobotProtocol:
         self._search_deadline_steps = int(search_deadline_steps)
         self._clarify_deadline_steps = int(clarify_deadline_steps)
         self._region_assigner = region_assigner
+        self._recruitable_hook = recruitable_hook
 
         self._state = RobotState.IDLE
         self.last_result: Optional[str] = None  # "complete" | "failed" | None
@@ -609,13 +621,53 @@ class RobotProtocol:
         self._pending_accept = set()
         self._searchers = set()
         self._peer_region = {}
-        self._reserve = list(self._peers)
         self._search_deadline = t + self._search_deadline_steps
+        allowed = self._current_recruitable()
+        self._reserve = self._recruitable_reserve(allowed)
         for peer, region in self._plan_assignment(self._reserve, self._regions):
             self._reserve.remove(peer)
             self._command_search(peer, region)
-        if not self._pending_accept:
+        # No peer to command. Single-mission (no budget -> ``allowed is None``): a
+        # hard dead end, fail now (byte-identical). Concurrent (budgeted): the
+        # sibling owner may currently hold the free peers, so stay in DELEGATING
+        # and re-attempt as they free up — the search deadline still bounds it.
+        if not self._pending_accept and allowed is None:
             self._fail_owner("no robots available to search", t)
+
+    def _current_recruitable(self) -> Optional[Set[str]]:
+        """The peers this owner may recruit right now, or ``None`` for no limit.
+
+        ``None`` (no hook, or the hook opting out) means every peer is fair game —
+        the historical single-mission behaviour, byte-identical. A concrete set
+        (concurrent mode) restricts recruitment to this owner's disjoint share of
+        the free peers so the K owners never contend for the same searcher.
+        """
+        if self._recruitable_hook is None:
+            return None
+        return self._recruitable_hook()
+
+    def _recruitable_reserve(self, allowed: Optional[Set[str]]) -> List[str]:
+        """The reserve peer list (in peer order), filtered to ``allowed`` if budgeted."""
+        if allowed is None:
+            return list(self._peers)
+        return [p for p in self._peers if p in allowed]
+
+    def _retry_delegation(self, t: int) -> None:
+        """Re-attempt recruitment for a budgeted owner that has no searcher yet.
+
+        A concurrent owner budgeted to zero currently-free peers waits in
+        OWNER_DELEGATING rather than failing; each tick it re-reads its (possibly
+        now larger) pool and commands whatever became available — so the moment
+        the sibling mission frees a robot into this owner's share, the search
+        starts. A no-op while the pool is still empty (the deadline bounds the
+        wait). Only reached with a budget active, so single-mission is untouched.
+        """
+        allowed = self._current_recruitable()
+        self._reserve = self._recruitable_reserve(allowed)
+        self._peer_region = {}
+        for peer, region in self._plan_assignment(self._reserve, self._regions):
+            self._reserve.remove(peer)
+            self._command_search(peer, region)
 
     def _plan_assignment(self, peers: Sequence[str],
                          regions: Sequence[str]) -> List[Tuple[str, str]]:
@@ -1102,7 +1154,14 @@ class RobotProtocol:
             if t >= self._search_deadline:
                 self._fail_owner("search exhausted", t)
             elif not self._pending_accept and not self._searchers:
-                self._fail_owner("all peers busy; nobody can search", t)
+                # No active or pending searcher. Single-mission (no budget): a hard
+                # dead end -> fail now (byte-identical). Concurrent (budgeted): the
+                # sibling owner is holding the free peers; keep waiting and
+                # re-attempt recruitment as they free up (deadline still bounds it).
+                if self._current_recruitable() is None:
+                    self._fail_owner("all peers busy; nobody can search", t)
+                else:
+                    self._retry_delegation(t)
         elif state is RobotState.OWNER_NAVIGATING:
             self._advance_navigating(t)
         elif state is RobotState.OWNER_DELIVERING:

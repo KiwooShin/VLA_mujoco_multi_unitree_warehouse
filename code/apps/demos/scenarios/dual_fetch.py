@@ -18,13 +18,21 @@ SCENARIO = Scenario(
     title="Two Objects, Two Owners, In Parallel",
     description="One order splits into two concurrent missions - both delivered to the pad",
     layout_kind="rooms",
-    spawn_seed=2,
-    planted={4: ("red", "cube"), 7: ("blue", "ball")},
+    spawn_seed=7,
+    # Both targets are deep-occluded in DIFFERENT rooms — the red cube in the far
+    # corner of storage A, the blue ball in the far corner of storage B — hidden
+    # from every robot's start sightline. So neither owner can see its object nor
+    # get a peer visibility report: BOTH must delegate a room-to-room search, and
+    # the two searches run in parallel on opposite sides of the warehouse (the
+    # whole point of the demo). The cross-owner searcher budget gives each owner
+    # its own searcher (never both to the first owner), and each searcher is the
+    # peer nearest its owner, so it sweeps the room that actually holds the target.
+    planted={2: ("red", "cube"), 5: ("blue", "ball")},
     instruction="Bring the red cube and the blue ball to the delivery pad",
     concurrent=True,
-    max_steps=3200,
-    decimation=4,
+    max_steps=5200,
+    decimation=5,
     gif_ss=2.5,
-    gif_dur=18.0,
-    poster_t=5.0,
+    gif_dur=17.0,
+    poster_t=10.0,
 )

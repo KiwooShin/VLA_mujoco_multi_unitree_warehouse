@@ -21,7 +21,7 @@ from __future__ import annotations
 import dataclasses
 import math
 import re
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 import mujoco
 
@@ -310,7 +310,8 @@ class MissionRunner:
                 reply_deadline_steps=reply_deadline_steps,
                 search_deadline_steps=search_deadline_steps,
                 clarify_deadline_steps=clarify_deadline_steps,
-                region_assigner=assigner)
+                region_assigner=assigner,
+                recruitable_hook=lambda cs=cs: self._recruitable_peers(cs))
 
         self._t = 0
         self._steps = 0
@@ -482,6 +483,9 @@ class MissionRunner:
         self._last_owner_query = None
         self._concurrent = False
         self._missions = []
+        # Restore the single-room search patrol (multi-room cycle is concurrent-only).
+        for act in self.actions.values():
+            act.enable_search_cycle(None)
         self.trails = {c: [] for c in self.callsigns}
         # Heavy DetectionResult payloads (a full grounding RGB frame + heatmap
         # each): never carry a prior mission's confirmations into the next one
@@ -624,6 +628,11 @@ class MissionRunner:
         tasks = [TaskSpec(TaskKind.FETCH, q, self._dest_name, self._dest_xy,
                           requester="user") for q in queries]
         self._concurrent = True
+        # Two owners share the fleet's searchers, so each owner's single searcher
+        # must sweep more than one room: enable the multi-room cycle on every
+        # robot's bridge (disabled again by reset_mission for the next mission).
+        for act in self.actions.values():
+            act.enable_search_cycle(self._regions)
         self._missions = [_MissionCtx(task=t, scan_base=self._mission_base)
                           for t in tasks]
         self.task = tasks[0]  # legacy single-field mirror (introspection back-compat)
@@ -803,6 +812,83 @@ class MissionRunner:
                           {"text": result.describe()})
             self.bus.post("allocator", result.winner, Performative.REQUEST_TASK,
                           {"task": ctx.task})
+
+    # -- cross-owner searcher budget (concurrent missions) ----------------
+    def _owner_done(self, owner: str) -> bool:
+        """Whether the concurrent mission owned by ``owner`` has reached a terminal."""
+        for ctx in self._missions:
+            if ctx.owner == owner:
+                return self._ctx_terminal(ctx)
+        return False
+
+    def _recruitable_peers(self, owner: str) -> Optional[Set[str]]:
+        """The peers ``owner`` may recruit as searchers right now (concurrent only).
+
+        Returns ``None`` outside concurrent mode so recruitment sees every peer —
+        the single-mission path is byte-identical. In a concurrent (K-owner)
+        mission this partitions the fleet's searcher capacity so the owners never
+        contend for the same robot (the searcher-starvation gap): the non-owner
+        peers are split into disjoint per-owner shares of at most
+        ``ceil(N_free / K)`` each (:meth:`_partition_searchers`), and, additionally,
+        any robot that is idle *now* and is neither reserved to a different
+        still-active owner nor itself a still-active owner (a finished mission's
+        owner or its just-freed searcher) is offered to this owner. So while both
+        missions run their pools stay disjoint, and the instant one finishes its
+        freed robots flow to whichever owner is still searching — the honest
+        recovery for the degenerate one-free-peer case (the short-handed owner
+        waits in OWNER_DELEGATING rather than failing, then recruits).
+        """
+        if not self._concurrent:
+            return None
+        owners = [c for c in self.callsigns
+                  if any(m.owner == c for m in self._missions)]
+        if not owners:
+            return set()
+        active_owners = [c for c in owners if not self._owner_done(c)]
+        non_owner = [c for c in self.callsigns if c not in owners]
+        share = self._partition_searchers(owners, non_owner)
+        reserved: Dict[str, str] = {p: o for o, ps in share.items() for p in ps}
+        allowed: Set[str] = set(share.get(owner, set()))
+        for p in self.callsigns:
+            if p == owner or not self.protocols[p].is_idle():
+                continue
+            r = reserved.get(p)
+            if r is not None and r != owner and r in active_owners:
+                continue  # still reserved to a different active owner
+            if p in active_owners:
+                continue  # never steal an owner mid-mission
+            allowed.add(p)
+        return allowed
+
+    def _partition_searchers(self, owners: Sequence[str],
+                             non_owner: Sequence[str]) -> Dict[str, Set[str]]:
+        """Split the free peers into disjoint per-owner searcher shares.
+
+        Each peer is paired to its NEAREST owner (Euclidean on current pose), so a
+        searcher helps the owner whose target region it is closest to — its nearest
+        unsearched room then tends to BE that owner's target room, and both objects
+        are found on the first sweep instead of after a cross-map room cycle. A
+        per-owner cap of ``ceil(N_free / K)`` keeps the shares balanced and disjoint
+        (greedy nearest-first, ties broken by callsign), so no owner is starved.
+        """
+        cap = max(1, math.ceil(len(non_owner) / max(1, len(owners))))
+        share: Dict[str, Set[str]] = {o: set() for o in owners}
+        count: Dict[str, int] = {o: 0 for o in owners}
+
+        def _d2(a: str, b: str) -> float:
+            (ax, ay), (bx, by) = self.fleet.units[a].xy, self.fleet.units[b].xy
+            return (ax - bx) ** 2 + (ay - by) ** 2
+
+        pairs = sorted(((_d2(p, o), p, o) for p in non_owner for o in owners),
+                       key=lambda t: (t[0], t[1], t[2]))
+        assigned: Set[str] = set()
+        for _dist, p, o in pairs:
+            if p in assigned or count[o] >= cap:
+                continue
+            share[o].add(p)
+            assigned.add(p)
+            count[o] += 1
+        return share
 
     def _try_allocate(self, task: TaskSpec) -> bool:
         """Attempt to assign one task to an idle robot; return whether it stuck."""
@@ -1170,6 +1256,20 @@ class MissionRunner:
             st = self.protocols[self.primary_owner].state
             if st in _OWNER_PHASE:
                 return _OWNER_PHASE[st]
+        else:
+            # Concurrent mode (no primary owner): summarize every live
+            # mission owner's state so the HUD never shows STANDING BY
+            # while two fetches are in flight.
+            owner_phrases = []
+            for ctx in self._missions:
+                if ctx.owner is None:
+                    continue
+                st = self.protocols[ctx.owner].state
+                if st in _OWNER_PHASE:
+                    owner_phrases.append(_OWNER_PHASE[st])
+            if owner_phrases:
+                uniq = sorted(set(owner_phrases))
+                return " + ".join(uniq) if len(uniq) > 1 else uniq[0]
         searching = [self._search[cs].region for cs in self.callsigns
                      if self._search[cs].active and self._search[cs].region]
         if searching:

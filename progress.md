@@ -425,6 +425,32 @@ User specified final-demo requirements F1-F6 (docs/final_demo_spec.md) at
 - Wrap-up: memory + docs sweep, then maintenance mode for the remaining
   session window (watchdog checks, user requests, no invented churn).
 
+---
+
+## 2026-07-13 21:55 — Demo Set v2 shipped (entry 10)
+
+User feedback (~19:00): v1 demos not fancy enough — needed harder tasks,
+always-on camera views, always-on comms, random starts, clarification of
+ambiguous orders, ≥6 scenarios. Delivered (bb3bba1, 8fcd42a):
+
+### New capabilities
+- CLARIFY/USER_REPLY dialogue (manifest-based options; robot clarifies
+  addressed orders, allocator clarifies fleet orders; scripted replies).
+- Random spawn poses (seeded, spacing + reachability gated).
+- Concurrent missions (2 owners; cross-owner searcher budget with
+  nearest-owner disjoint pools after production exposed starvation;
+  multi-room sweep for budgeted searchers).
+- Sequential multi-goal legs; mid-mission retask.
+- DemoComposer: 1600×900 production canvas — BEV + always-on comms panel
+  + always-on adaptive ego strip (4/6 tiles, comm-glow), title cards.
+
+### demo/ (committed): six scenarios, mp4+gif+poster each
+clarify_fetch, unseen_map (sampled layout), dual_fetch (two owners in
+parallel, both targets deep-occluded), relay_multigoal, retask,
+six_robot_flagship — ALL on the full learned stack (groundnet+VLA),
+all frame-verified. Suite 1655 OK. Single-mission paths byte-identical
+throughout (SHA-verified transcripts).
+
 ### Performance (final headline set)
 | Metric | Value |
 |---|---|
